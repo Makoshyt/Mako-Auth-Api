@@ -35,6 +35,7 @@ enum AuditEventType {
   PASSWORD_RESET_SUCCESS
   TOKEN_REUSE_DETECTED
   ACCESS_DENIED
+  RATE_LIMIT_EXCEEDED // primeiro bloqueio (429) de uma chave na janela; nunca um por requisição
 }
 
 enum AlertRule {

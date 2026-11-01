@@ -1,5 +1,5 @@
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
-import { bearerAuth, errorResponseSchema } from '../../shared/http-schemas.js';
+import { bearerAuth, errorResponseSchema, failClosedResponses } from '../../shared/http-schemas.js';
 import { authOf } from '../auth/auth.middleware.js';
 import {
   publicUserSchema,
@@ -26,6 +26,8 @@ export const usersRoutes: FastifyPluginAsyncZod<UsersRoutesOptions> = async (app
   app.post(
     '/auth/register',
     {
+      // Por IP, antes de ler o corpo: limita a criação de contas em massa e o custo do Argon2id.
+      onRequest: app.rateLimit.hook('register'),
       schema: {
         tags: ['Auth'],
         summary: 'Cadastro de usuário',
@@ -37,6 +39,7 @@ export const usersRoutes: FastifyPluginAsyncZod<UsersRoutesOptions> = async (app
           201: publicUserSchema,
           400: errorResponseSchema.describe('Dados inválidos ou senha fraca (WEAK_PASSWORD)'),
           409: errorResponseSchema.describe('Email já cadastrado'),
+          ...failClosedResponses,
         },
       },
     },
@@ -70,7 +73,7 @@ export const usersRoutes: FastifyPluginAsyncZod<UsersRoutesOptions> = async (app
   app.patch(
     '/users/me',
     {
-      onRequest: app.authenticate,
+      onRequest: [app.authenticate, app.rateLimit.hook('updateProfile')],
       schema: {
         tags: ['Users'],
         summary: 'Atualiza nome e/ou email do usuário autenticado',
@@ -88,6 +91,7 @@ export const usersRoutes: FastifyPluginAsyncZod<UsersRoutesOptions> = async (app
           ),
           403: errorResponseSchema.describe('INVALID_CURRENT_PASSWORD'),
           409: errorResponseSchema.describe('Email já cadastrado'),
+          ...failClosedResponses,
         },
       },
     },

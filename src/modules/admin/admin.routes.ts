@@ -1,5 +1,5 @@
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
-import { bearerAuth, errorResponseSchema } from '../../shared/http-schemas.js';
+import { bearerAuth, errorResponseSchema, rateLimitResponses } from '../../shared/http-schemas.js';
 import { requireRole } from '../auth/auth.middleware.js';
 import { publicUserSchema, toPublicUserDto } from '../users/users.schemas.js';
 import {
@@ -21,6 +21,7 @@ const protectedResponses = {
   400: errorResponseSchema.describe('Parâmetros inválidos'),
   401: errorResponseSchema.describe('Token ausente, inválido, expirado ou sessão encerrada'),
   403: errorResponseSchema.describe('Autenticado, mas sem o papel ADMIN'),
+  ...rateLimitResponses,
 };
 
 /**
@@ -33,12 +34,24 @@ const protectedResponses = {
 export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app, options) => {
   const { adminService } = options;
 
+  // Toda rota admin PRECISA declarar `config.rateLimit`: sem isso, o servidor nem sobe.
+  app.addHook('onRoute', (route) => {
+    if (!route.config?.rateLimit) {
+      throw new Error(
+        `rota admin ${route.method.toString()} ${route.url} sem política de rate limit`,
+      );
+    }
+  });
+  // Ordem: quem é (401) → limite por usuário (429) → papel (403). O limite antes do papel
+  // também contém um USER insistindo em rotas admin (cada 403 grava um ACCESS_DENIED).
   app.addHook('onRequest', app.authenticate);
+  app.addHook('onRequest', app.rateLimit.fromRouteConfig());
   app.addHook('onRequest', requireRole('ADMIN'));
 
   app.get(
     '/users',
     {
+      config: { rateLimit: 'adminUsers' },
       schema: {
         tags: ['Admin'],
         summary: 'Lista usuários (paginado)',
@@ -59,6 +72,7 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
   app.get(
     '/users/:id',
     {
+      config: { rateLimit: 'adminUserById' },
       schema: {
         tags: ['Admin'],
         summary: 'Consulta um usuário pelo id',
@@ -77,6 +91,7 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
   app.get(
     '/audit-events',
     {
+      config: { rateLimit: 'adminAuditEvents' },
       schema: {
         tags: ['Admin'],
         summary: 'Consulta a trilha de auditoria (paginado)',

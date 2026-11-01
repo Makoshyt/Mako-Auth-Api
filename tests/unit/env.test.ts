@@ -6,6 +6,7 @@ const required = {
   DATABASE_URL: 'postgresql://user:pass@localhost:5433/db',
   REDIS_URL: 'redis://localhost:6379',
   JWT_ACCESS_SECRET: 'segredo-ficticio-de-teste-com-32-caracteres-ou-mais',
+  RATE_LIMIT_HMAC_SECRET: 'outro-segredo-ficticio-para-o-hmac-de-rate-limit',
 };
 
 function captureError(fn: () => unknown): EnvValidationError {
@@ -34,14 +35,31 @@ describe('loadEnv', () => {
       REFRESH_TOKEN_TTL_DAYS: 7,
       SESSION_ABSOLUTE_TTL_DAYS: 30,
       REFRESH_REUSE_GRACE_SECONDS: 10,
+      RATE_LIMIT_KEY_PREFIX: 'authapi:rl',
+      // Defaults da Etapa 6 (janelas em ms).
+      RATE_LIMIT_LOGIN_IP: { max: 5, windowMs: 15 * 60_000 },
+      RATE_LIMIT_LOGIN_ACCOUNT: { max: 10, windowMs: 60 * 60_000 },
+      RATE_LIMIT_REGISTER_IP: { max: 5, windowMs: 60 * 60_000 },
+      RATE_LIMIT_REFRESH_IP: { max: 20, windowMs: 15 * 60_000 },
+      RATE_LIMIT_LOGOUT_USER: { max: 20, windowMs: 15 * 60_000 },
+      RATE_LIMIT_LOGOUT_ALL_USER: { max: 5, windowMs: 15 * 60_000 },
+      RATE_LIMIT_UPDATE_PROFILE_USER: { max: 10, windowMs: 15 * 60_000 },
+      RATE_LIMIT_ADMIN_USERS: { max: 60, windowMs: 60_000 },
+      RATE_LIMIT_ADMIN_USER_BY_ID: { max: 60, windowMs: 60_000 },
+      RATE_LIMIT_ADMIN_AUDIT_EVENTS: { max: 30, windowMs: 60_000 },
       ...required,
     });
   });
 
-  it('exige DATABASE_URL, REDIS_URL e JWT_ACCESS_SECRET', () => {
+  it('exige DATABASE_URL, REDIS_URL, JWT_ACCESS_SECRET e RATE_LIMIT_HMAC_SECRET', () => {
     const error = captureError(() => loadEnv({}));
     const fields = error.issues.map((issue) => issue.split(':')[0]);
-    expect(fields).toEqual(['DATABASE_URL', 'REDIS_URL', 'JWT_ACCESS_SECRET']);
+    expect(fields).toEqual([
+      'DATABASE_URL',
+      'REDIS_URL',
+      'JWT_ACCESS_SECRET',
+      'RATE_LIMIT_HMAC_SECRET',
+    ]);
   });
 
   it('rejeita JWT_ACCESS_SECRET curto sem expor o valor', () => {
@@ -76,13 +94,13 @@ describe('loadEnv', () => {
       ...required,
       PORT: '8080',
       SWAGGER_ENABLED: 'false',
-      TRUST_PROXY: 'true',
+      TRUST_PROXY: '1',
       CORS_ORIGINS: ' http://a.example.com , http://b.example.com ,',
     });
 
     expect(env.PORT).toBe(8080);
     expect(env.SWAGGER_ENABLED).toBe(false);
-    expect(env.TRUST_PROXY).toBe(true);
+    expect(env.TRUST_PROXY).toBe(1);
     expect(env.CORS_ORIGINS).toEqual(['http://a.example.com', 'http://b.example.com']);
   });
 
@@ -114,5 +132,87 @@ describe('loadEnv', () => {
     expect(
       loadEnv({ ...required, NODE_ENV: 'development', CORS_ORIGINS: '*' }).CORS_ORIGINS,
     ).toEqual(['*']);
+  });
+
+  describe('TRUST_PROXY', () => {
+    it.each([
+      ['false', false],
+      ['', false],
+      ['1', 1],
+      ['2', 2],
+      ['10.0.0.1', ['10.0.0.1']],
+      ['10.0.0.0/8, 172.16.0.0/12 ,::1/128', ['10.0.0.0/8', '172.16.0.0/12', '::1/128']],
+    ])('aceita "%s"', (value, expected) => {
+      expect(loadEnv({ ...required, TRUST_PROXY: value }).TRUST_PROXY).toEqual(expected);
+    });
+
+    it.each([
+      'true',
+      'TRUE',
+      '0',
+      '11',
+      '10.0.0.0/33',
+      '999.1.1.1',
+      'proxy.local',
+      '10.0.0.1,lixo',
+    ])('recusa "%s" (true confiaria em X-Forwarded-For forjado pelo cliente)', (value) => {
+      const error = captureError(() => loadEnv({ ...required, TRUST_PROXY: value }));
+      expect(error.issues).toEqual([expect.stringMatching(/^TRUST_PROXY: /)]);
+    });
+  });
+
+  describe('rate limiting', () => {
+    it('converte "<máximo>/<janela>" para máximo e janela em ms', () => {
+      const env = loadEnv({
+        ...required,
+        RATE_LIMIT_LOGIN_IP: '3/30s',
+        RATE_LIMIT_REGISTER_IP: '2/2h',
+        RATE_LIMIT_ADMIN_USERS: '100/1m',
+      });
+
+      expect(env.RATE_LIMIT_LOGIN_IP).toEqual({ max: 3, windowMs: 30_000 });
+      expect(env.RATE_LIMIT_REGISTER_IP).toEqual({ max: 2, windowMs: 7_200_000 });
+      expect(env.RATE_LIMIT_ADMIN_USERS).toEqual({ max: 100, windowMs: 60_000 });
+    });
+
+    it.each([
+      '5',
+      '5/',
+      '/15m',
+      '0/15m',
+      '5/0s',
+      '5/15d',
+      '5/25h',
+      'cinco/15m',
+      '-1/15m',
+      '200000/1m',
+    ])('recusa política inválida: "%s"', (value) => {
+      const error = captureError(() => loadEnv({ ...required, RATE_LIMIT_LOGIN_IP: value }));
+      expect(error.issues).toEqual([expect.stringMatching(/^RATE_LIMIT_LOGIN_IP: /)]);
+    });
+
+    it('recusa RATE_LIMIT_HMAC_SECRET curto, sem expor o valor', () => {
+      const weak = 'hmac-curto';
+
+      const error = captureError(() => loadEnv({ ...required, RATE_LIMIT_HMAC_SECRET: weak }));
+      expect(error.issues).toEqual([expect.stringMatching(/^RATE_LIMIT_HMAC_SECRET: /)]);
+      expect(error.message).not.toContain(weak);
+    });
+
+    it('recusa RATE_LIMIT_HMAC_SECRET igual ao JWT_ACCESS_SECRET', () => {
+      const error = captureError(() =>
+        loadEnv({ ...required, RATE_LIMIT_HMAC_SECRET: required.JWT_ACCESS_SECRET }),
+      );
+      expect(error.issues).toEqual([expect.stringMatching(/^RATE_LIMIT_HMAC_SECRET: .*diferente/)]);
+    });
+
+    it.each(['com espaço', 'a'.repeat(65), ':comeca-com-dois-pontos', 'rl*'])(
+      'recusa RATE_LIMIT_KEY_PREFIX inválido: "%s"',
+      (value) => {
+        expect(() => loadEnv({ ...required, RATE_LIMIT_KEY_PREFIX: value })).toThrow(
+          /RATE_LIMIT_KEY_PREFIX/,
+        );
+      },
+    );
   });
 });

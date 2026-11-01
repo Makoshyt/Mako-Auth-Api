@@ -22,6 +22,9 @@ import { authRoutes } from './modules/auth/auth.routes.js';
 import { createAuthService } from './modules/auth/auth.service.js';
 import { createAccessTokenSigner } from './modules/auth/tokens.js';
 import { healthRoutes } from './modules/health/health.routes.js';
+import { buildPolicies } from './modules/rate-limit/rate-limit.policies.js';
+import { createRedisRateLimitStore } from './modules/rate-limit/rate-limit.store.js';
+import { createRateLimiter, registerRateLimiting } from './modules/rate-limit/rate-limiter.js';
 import { databaseCheck, redisCheck } from './modules/health/readiness.js';
 import { createUsersRepository } from './modules/users/users.repository.js';
 import { usersRoutes } from './modules/users/users.routes.js';
@@ -29,6 +32,15 @@ import { createUsersService } from './modules/users/users.service.js';
 import { registerSwagger } from './plugins/swagger.js';
 import { registerErrorHandling } from './shared/error-handler.js';
 import { hashPassword, verifyPassword } from './shared/password-hasher.js';
+
+/**
+ * Converte TRUST_PROXY para o Fastify. Um número N vira a função equivalente
+ * "confia nos N saltos mais próximos" (é o que o proxy-addr faz com números); os tipos do
+ * Fastify só aceitam a forma de função.
+ */
+export function trustProxyOption(value: Env['TRUST_PROXY']) {
+  return typeof value === 'number' ? (_address: string, hop: number) => hop < value : value;
+}
 
 export interface AppDependencies {
   env: Env;
@@ -52,7 +64,7 @@ export async function buildApp({
   const app = Fastify({
     logger: buildLoggerOptions(env, logDestination),
     genReqId: () => randomUUID(),
-    trustProxy: env.TRUST_PROXY,
+    trustProxy: trustProxyOption(env.TRUST_PROXY),
     // Payloads de autenticação são pequenos; limitar reduz superfície de abuso.
     bodyLimit: 16 * 1024,
   }).withTypeProvider<ZodTypeProvider>();
@@ -64,6 +76,13 @@ export async function buildApp({
   await app.register(cors, {
     // Lista vazia = nenhuma origem cross-origin permitida.
     origin: env.CORS_ORIGINS.length > 0 ? env.CORS_ORIGINS : false,
+    // Sem isto, um front-end em outra origem não consegue ler quanto tempo esperar após um 429.
+    exposedHeaders: [
+      'Retry-After',
+      'X-RateLimit-Limit',
+      'X-RateLimit-Remaining',
+      'X-RateLimit-Reset',
+    ],
   });
 
   // O swagger precisa ser registrado antes das rotas para coletá-las.
@@ -96,6 +115,16 @@ export async function buildApp({
 
   // No contexto raiz: `app.authenticate` e `request.auth` ficam visíveis para todos os módulos.
   registerAuthentication(app, authService, audit);
+  // Contadores no Redis compartilhado: o limite vale para todas as instâncias da API juntas.
+  registerRateLimiting(
+    app,
+    createRateLimiter({
+      store: createRedisRateLimitStore(redis),
+      policies: buildPolicies(env),
+      hmacSecret: env.RATE_LIMIT_HMAC_SECRET,
+      keyPrefix: env.RATE_LIMIT_KEY_PREFIX,
+    }),
+  );
 
   // Helmet fica no contexto encapsulado da API: a CSP restritiva vale para as
   // respostas JSON, sem quebrar os assets da interface do Swagger em /docs.

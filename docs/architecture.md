@@ -1,6 +1,6 @@
 # Arquitetura e decisões técnicas
 
-> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 5 (autorização administrativa e auditoria)**.
+> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 6 (rate limiting com Redis)**.
 
 ## Visão geral
 
@@ -398,7 +398,7 @@ derrubar as outras sessões expulsa quem estiver usando credenciais antigas.
 | Escalonamento de privilégios             | `role` vem do banco a cada requisição (promoção e rebaixamento valem na hora). Cadastro e PATCH rejeitam `role` (strictObject). `requireRole` distingue 401 de 403                                 |
 | IDOR / acesso a dados de outros usuários | Nenhuma rota recebe id de usuário ou de sessão. `request.auth` só é preenchido pelo `authenticate`. `authOf` falha fechada (401) se a rota esquecer o hook                                         |
 | Enumeração de contas no login            | Resposta única (`INVALID_CREDENTIALS`) e verificação contra hash fictício, com tempo medido equivalente                                                                                            |
-| Força bruta e credential stuffing        | **Parcial:** custo do Argon2id e trilha `LOGIN_FAILURE` com `email_hash` e IP. Rate limit por IP e por conta na **Etapa 6**                                                                        |
+| Força bruta e credential stuffing        | Custo do Argon2id, trilha `LOGIN_FAILURE` e, desde a Etapa 6, rate limit por IP (5/15 min) e por conta (10/h, HMAC do email)                                                                       |
 | Tomada de conta via troca de email       | Exige a senha atual e revoga as demais sessões na mesma transação                                                                                                                                  |
 | Vazamento em logs                        | Body e headers não são logados, e a redação do Pino é a segunda barreira. Teste automatizado (nível `trace`, fluxo completo) e verificação no servidor compilado: 0 ocorrências de senhas e tokens |
 | Vazamento de detalhes do banco           | Erros não mapeados viram 500 genérico. O detalhe vai só para o log                                                                                                                                 |
@@ -406,7 +406,7 @@ derrubar as outras sessões expulsa quem estiver usando credenciais antigas.
 
 ### Limitações conhecidas
 
-- **Sem rate limiting** até a Etapa 6.
+- ~~Sem rate limiting~~: resolvido na Etapa 6.
 - **Refresh token no corpo JSON**, não em cookie `HttpOnly`. Proteger o armazenamento fica a
   cargo do cliente. Cookies exigiriam proteção contra CSRF e foram deixados para quando houver
   um cliente web definido.
@@ -556,3 +556,205 @@ antigos não são alterados.
   investigar abuso. A retenção acima limita a exposição no tempo.
 - **Um único papel administrativo**, sem permissões finas (ex.: "auditor" só lê eventos). Se
   surgirem perfis distintos, o `requireRole` evolui para checagem por permissão.
+
+## Etapa 6: rate limiting com Redis
+
+### Por que uma implementação própria, e não `@fastify/rate-limit`
+
+O código-fonte do `@fastify/rate-limit` 11.2.1 foi lido antes da decisão. Ele é sólido, e o
+store Redis usa o mesmo padrão Lua adotado aqui, mas não atende quatro requisitos sem
+contorções:
+
+| Requisito                                                                | `@fastify/rate-limit` 11.2.1                                                                                           |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Redis fora do ar → **503** nas rotas sensíveis, liberar nas demais       | Com `skipOnError: false`, relança o erro bruto do ioredis, que vira 500. Com `true`, libera tudo. Não há modo por rota |
+| Dois limites no login, e o da conta **só** consumido se o de IP passou   | Um limite por rota via `config`. Um segundo exigiria um hook manual, sem controle da ordem de consumo                  |
+| Auditar só o **primeiro** bloqueio da janela                             | `onExceeded(req, key)` não recebe o valor do contador                                                                  |
+| Chave HMAC e limite por usuário **entre** `authenticate` e `requireRole` | Possível com `keyGenerator` e `hook`, mas a soma das adaptações supera o tamanho de uma implementação dedicada         |
+
+A implementação própria tem cerca de 200 linhas, em 4 arquivos, e não adiciona dependências.
+
+### Estrutura
+
+```
+src/modules/rate-limit/
+  rate-limit.store.ts     # contador no Redis: script Lua atômico (INCR + PTTL + PEXPIRE)
+  rate-limit.policies.ts  # políticas: escopo, modo de falha, cabeçalhos; valores vêm do env
+  rate-limiter.ts         # chaves HMAC, hooks Fastify, 429/503, auditoria deduplicada
+  client-ip.ts            # normalização de IP (IPv4 mapeado, IPv6 por /64)
+```
+
+```mermaid
+flowchart LR
+  R[Requisição] --> P{Política da rota}
+  P -- escopo ip --> I[rateLimitIpKey&#40;request.ip&#41;<br/>respeita TRUST_PROXY]
+  P -- escopo user --> U[authOf&#40;request&#41;.userId<br/>depois do authenticate]
+  P -- escopo account --> A[email do corpo já normalizado<br/>preHandler]
+  I & U & A --> K["chave = prefixo:política:escopo:HMAC-SHA256(escopo:valor)"]
+  K --> L[EVAL script Lua no Redis<br/>INCR · PEXPIRE na 1ª · PTTL]
+  L -- erro/timeout 1 s --> F{modo de falha}
+  F -- closed --> E503[503 SERVICE_UNAVAILABLE]
+  F -- open --> OK[segue]
+  L -- "count ≤ max" --> OK
+  L -- "count = max+1" --> AU[audit RATE_LIMIT_EXCEEDED<br/>+ log, uma vez] --> E429[429 RATE_LIMITED]
+  L -- "count > max+1" --> E429
+```
+
+### Algoritmo e atomicidade
+
+**Janela fixa iniciada no primeiro acesso.** O primeiro `INCR` cria a chave e o `PEXPIRE` define
+a janela. Os seguintes só incrementam, sem estender o TTL. O script inteiro roda de forma
+atômica no Redis, então N instâncias concorrentes nunca perdem contagens nem deixam uma chave
+sem expiração. Um `PTTL < 0` (chave sem TTL, por qualquer motivo) recebe TTL em vez de bloquear
+para sempre. Só são usados comandos O(1). `KEYS`, `SCAN` e comandos bloqueantes ficam fora do
+caminho da requisição.
+
+Testado contra o Redis real:
+
+- 20 logins simultâneos do mesmo IP resultaram em exatamente 5 avaliados e 15 bloqueados;
+- duas instâncias da API com o mesmo namespace somaram no mesmo contador;
+- a chave expirou com a janela;
+- o TTL observado no Redis corresponde à janela da política.
+
+### Chaves
+
+`<RATE_LIMIT_KEY_PREFIX>:<política>:<escopo>:<HMAC-SHA256(segredo, "escopo:valor")>`
+
+- **Namespace** próprio (`authapi:rl` por padrão). Os testes usam
+  `authapi-test:rl:<uuid>` por app, e a limpeza recusa qualquer prefixo fora desse namespace.
+  Ela usa `SCAN` + `DEL`, nunca `FLUSHALL` ou `FLUSHDB`.
+- **HMAC com segredo separado** (`RATE_LIMIT_HMAC_SECRET`, mínimo de 32 caracteres, diferente
+  do segredo do JWT, validado na inicialização). Quem ler o Redis não consegue testar emails ou
+  IPs por dicionário, o que seria trivial com um SHA-256 simples.
+- **Sem colisão** entre rotas (a política está no nome), entre escopos (o escopo entra no nome e
+  no HMAC) e entre identificadores (256 bits).
+- **Identificadores normalizados:**
+  - email: trim e minúsculas, pelo mesmo schema Zod do login;
+  - IP: `::ffff:1.2.3.4` vira `1.2.3.4`, IPv6 é agrupado por **/64**, maiúsculas e zona são
+    removidas.
+    Sem isso, grafias diferentes do mesmo cliente teriam contadores diferentes, e um IPv6 trocaria
+    de endereço a cada tentativa.
+- JWTs e refresh tokens nunca entram em chaves.
+
+### Proteção por IP e por conta no login
+
+```mermaid
+sequenceDiagram
+  participant C as Cliente
+  participant A as API
+  participant R as Redis
+  C->>A: POST /auth/login
+  A->>R: onRequest: hit(loginIp:ip:HMAC(ip))
+  alt IP acima de 5/15 min
+    A-->>C: 429 (a conta NÃO é contada)
+  else
+    A->>A: parse + Zod (email normalizado)
+    A->>R: preHandler: hit(loginAccount:account:HMAC(email))
+    alt conta acima de 10/h
+      A-->>C: 429 (mesma resposta, sem X-RateLimit-*)
+    else
+      A->>A: Argon2id, sessão, tokens (Etapa 4)
+    end
+  end
+```
+
+- **Só por IP** deixaria passar credential stuffing distribuído (milhares de IPs, 5 tentativas
+  cada, contra a mesma conta). **Só por conta** deixaria qualquer um bloquear a vítima. Os dois
+  juntos, com a conta consumida apenas depois do IP, exigem do atacante muitos IPs **e** limitam
+  o dano à vítima. Há teste: 30 tentativas de um IP consomem só 5 da conta.
+- **Bloqueio deliberado ainda é possível** com 2 ou mais IPs (10 tentativas/h travam a conta por
+  até 1 h). É o custo inerente a um limite por conta, e a janela curta o mantém temporário. Ver
+  limitações.
+- O limite por conta vale igual para emails existentes e inexistentes, porque é calculado sobre
+  o email enviado. A resposta não revela se a conta existe.
+
+### Ordem dos hooks
+
+| Rota                         | Ordem                                                                                          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| login                        | `onRequest`: IP → parse → Zod → `preHandler`: conta → handler                                  |
+| register, refresh            | `onRequest`: IP → parse → Zod → handler                                                        |
+| logout, logout-all, PATCH me | `onRequest`: **authenticate** → usuário → parse → Zod → handler                                |
+| admin                        | `onRequest` (plugin): **authenticate** → usuário (`config.rateLimit`) → `requireRole('ADMIN')` |
+
+- **401 vem antes de 429.** Anônimos nunca consomem o limite por usuário e não recebem `429`, que
+  não lhes daria informação alguma.
+- **Rotas admin:** o limite vem antes do papel. Um USER recebe `403` até o limite (60 ou 30 por
+  minuto) e `429` depois, o que limita a gravação de `ACCESS_DENIED` (risco da Etapa 5). O `429`
+  não revela nada protegido: as rotas já estão no OpenAPI. Toda rota admin precisa declarar
+  `config.rateLimit`, e um hook `onRoute` impede o servidor de subir sem isso.
+
+### Redis indisponível
+
+| Política                                    | Modo              | Motivo                                                                                           |
+| ------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------ |
+| loginIp, loginAccount, register, refresh    | **fechado** (503) | Liberar geral permitiria força bruta e cadastro em massa enquanto o Redis estiver fora           |
+| updateProfile                               | **fechado** (503) | A troca de email confere a senha atual: seria força bruta sem limite                             |
+| logout, logoutAll                           | aberto            | Encerrar a própria sessão é uma ação de segurança, e bloqueá-la só prejudica o usuário           |
+| adminUsers, adminUserById, adminAuditEvents | aberto            | Leituras de usuários já autenticados como ADMIN. O limite aqui protege recursos, não credenciais |
+
+- **503 `SERVICE_UNAVAILABLE`** com `Retry-After: 10` e mensagem genérica. Nunca `401`, para que
+  a falha de infraestrutura não pareça credencial inválida. O motivo vai só para o log, com o
+  nome da política e a mensagem do erro, sem chave nem identificador.
+- **Timeout de 1 s** por chamada: um Redis lento conta como indisponível, em vez de prender a
+  requisição.
+- O cliente Redis já tinha `enableOfflineQueue: false` (Etapa 2): sem conexão, o comando falha na
+  hora, sem acumular em memória.
+- **Sem contagem parcial:** cada `hit` é um único script atômico. No login, o limite por conta
+  não é consumido se o de IP falhou ou bloqueou.
+
+### TRUST_PROXY
+
+Antes, `TRUST_PROXY=true` era aceito. No Fastify, isso confia em **qualquer** `X-Forwarded-For`
+e usa o primeiro endereço, que o cliente escolhe. Bastaria trocar o header a cada tentativa para
+nunca ser limitado. Agora:
+
+| Valor            | Comportamento                                                                                                                 |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `false` (padrão) | IP da conexão TCP; o header é ignorado                                                                                        |
+| `1` a `10`       | Confia nos N saltos mais próximos (convertido para a função `(endereço, salto) => salto < N`, que é o que o `proxy-addr` faz) |
+| IPs/CIDRs        | Confia no header só quando a conexão vem de um desses proxies                                                                 |
+| `true`           | **Recusado** na inicialização, com mensagem explicando a alternativa                                                          |
+
+Testado: com `false`, 7 tentativas com `X-Forwarded-For` diferente em cada uma resultaram em 5
+permitidas e 2 bloqueadas. Com `1`, variar o endereço forjado à esquerda não muda o contador.
+Com CIDR, uma conexão de fora do CIDR não consegue se passar por outros clientes. O teste manual
+com curl no servidor compilado confirmou o comportamento de `false`.
+
+### Auditoria
+
+- Novo tipo **`RATE_LIMIT_EXCEEDED`**, criado por migration aditiva (`ALTER TYPE ... ADD VALUE`).
+- **Sem amplificação:** o evento e o log de aviso saem só quando o contador atômico passa por
+  `max + 1`, ou seja, uma vez por chave e janela. Medido no servidor compilado: as tentativas 6
+  e 7 receberam 429 e houve um único evento. Para gerar N eventos, um atacante precisa de N IPs
+  (ou contas, ou usuários) distintos e ainda esperar a janela de cada um.
+- **Conteúdo:** `ip`, `userId` (escopo de usuário), `emailHash` (escopo de conta, com o mesmo
+  SHA-256 da trilha de login) e `{ policy, scope, limit, windowSeconds }`. Nunca entram chaves
+  Redis, HMACs, emails em texto, tokens ou senhas.
+
+### Testes antigos adaptados (e por quê)
+
+| Mudança                                                                                                           | Motivo                                                                                                                                  | Garantia preservada                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `testEnv` usa limites altos por padrão (`RELAXED_RATE_LIMITS`)                                                    | As suítes de auth, users e admin fazem dezenas de logins do mesmo IP (`127.0.0.1`) e testam autenticação, RBAC e auditoria, não limites | Nenhuma asserção delas foi alterada. Os limites reais são testados à parte, com os defaults de produção (`rateLimits: 'default'`) |
+| Cada app de teste ganha um namespace Redis aleatório, limpo ao fechar                                             | Isola contadores entre testes e execuções                                                                                               | A limpeza recusa prefixos fora de `authapi-test:rl:`                                                                              |
+| `buildTestApp` conecta o Redis por padrão; `ready.test` passa `connectRedis: false` nos casos de Redis fora do ar | As rotas limitadas precisam do Redis                                                                                                    | Os testes de `/ready` continuam verificando 200 e 503                                                                             |
+| `env.test`: `TRUST_PROXY: 'true'` virou `'1'`, e foi incluída a nova variável obrigatória                         | `true` agora é recusado de propósito                                                                                                    | Novos testes verificam a recusa de `true` e os modos aceitos                                                                      |
+
+### Limitações conhecidas
+
+- **Rajada na virada da janela:** com janela fixa, um cliente pode fazer 5 tentativas no fim de
+  uma janela e mais 5 no início da seguinte. A janela deslizante ou o GCRA resolvem, a um custo
+  maior. A Etapa 8 (detecção de ataques) complementa com análise da trilha.
+- **Bloqueio deliberado da conta:** possível com poucos IPs (10 tentativas/h). Mitigações
+  futuras: só contar falhas, liberar dispositivos já reconhecidos ou exigir CAPTCHA em vez de
+  bloquear.
+- **Redis único:** sem réplica, uma queda do Redis deixa login, cadastro e refresh em 503 (é a
+  escolha fail-closed). Em produção, use Redis com alta disponibilidade.
+- **NAT e CGNAT:** muitos usuários atrás do mesmo IP compartilham o limite por IP. Os defaults
+  são conservadores e devem ser calibrados com métricas reais.
+- **IPv6 por /64:** um provedor que entregue blocos maiores (/56, /48) a um cliente permite
+  alternar entre /64s. Agrupar por /56 é uma opção se houver abuso.
+- **Sem limite global por IP** nas rotas não listadas (ex.: `GET /users/me`) nem limitação de
+  conexões. Isso fica a cargo do proxy reverso ou do WAF.
+- **Trocar `RATE_LIMIT_HMAC_SECRET` zera todos os contadores**, porque as chaves mudam.

@@ -1,6 +1,11 @@
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import { bearerAuth, errorResponseSchema } from '../../shared/http-schemas.js';
+import {
+  bearerAuth,
+  errorResponseSchema,
+  failClosedResponses,
+  rateLimitResponses,
+} from '../../shared/http-schemas.js';
 import { authOf, clientInfo } from './auth.middleware.js';
 import {
   loginBodySchema,
@@ -16,8 +21,12 @@ interface AuthRoutesOptions {
 
 /**
  * Login, refresh e logout. O cadastro (POST /auth/register) fica no módulo users.
- * Rate limit por IP e por conta chega na Etapa 6; até lá, a única proteção contra força
- * bruta é o custo do Argon2id e a trilha de auditoria (LOGIN_FAILURE).
+ *
+ * Rate limit (Etapa 6), na ordem em que roda:
+ *  - login: por IP em onRequest (antes de ler o corpo) e, só se passar, por conta (HMAC do
+ *    email) em preHandler. Um IP já bloqueado não consome o limite da conta, então não
+ *    consegue travar a conta de outra pessoa sozinho.
+ *  - refresh: por IP. logout/logout-all: por usuário, DEPOIS do authenticate (401 vem antes de 429).
  */
 export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, options) => {
   const { authService } = options;
@@ -25,6 +34,8 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
   app.post(
     '/auth/login',
     {
+      onRequest: app.rateLimit.hook('loginIp'),
+      preHandler: app.rateLimit.hook('loginAccount'),
       schema: {
         tags: ['Auth'],
         summary: 'Login',
@@ -36,6 +47,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
           200: tokenPairSchema,
           400: errorResponseSchema.describe('Dados inválidos'),
           401: errorResponseSchema.describe('INVALID_CREDENTIALS'),
+          ...failClosedResponses,
         },
       },
     },
@@ -48,6 +60,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
   app.post(
     '/auth/refresh',
     {
+      onRequest: app.rateLimit.hook('refresh'),
       schema: {
         tags: ['Auth'],
         summary: 'Troca o refresh token por um novo par (rotação)',
@@ -60,6 +73,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
           400: errorResponseSchema.describe('Dados inválidos'),
           401: errorResponseSchema.describe('INVALID_REFRESH_TOKEN ou REFRESH_TOKEN_REUSED'),
           409: errorResponseSchema.describe('REFRESH_TOKEN_ALREADY_ROTATED (corrida legítima)'),
+          ...failClosedResponses,
         },
       },
     },
@@ -73,7 +87,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
     '/auth/logout',
     {
       // onRequest: autentica antes de ler e validar o corpo (anônimo recebe 401, não 400).
-      onRequest: app.authenticate,
+      onRequest: [app.authenticate, app.rateLimit.hook('logout')],
       schema: {
         tags: ['Auth'],
         summary: 'Encerra a sessão atual',
@@ -84,6 +98,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
         response: {
           204: z.null().describe('Sessão encerrada'),
           401: errorResponseSchema.describe('Token ausente, inválido ou sessão já encerrada'),
+          ...rateLimitResponses,
         },
       },
     },
@@ -96,7 +111,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
   app.post(
     '/auth/logout-all',
     {
-      onRequest: app.authenticate,
+      onRequest: [app.authenticate, app.rateLimit.hook('logoutAll')],
       schema: {
         tags: ['Auth'],
         summary: 'Encerra todas as sessões do usuário',
@@ -105,6 +120,7 @@ export const authRoutes: FastifyPluginAsyncZod<AuthRoutesOptions> = async (app, 
         response: {
           204: z.null().describe('Sessões encerradas'),
           401: errorResponseSchema.describe('Token ausente, inválido ou sessão já encerrada'),
+          ...rateLimitResponses,
         },
       },
     },

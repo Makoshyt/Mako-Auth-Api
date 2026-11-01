@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 const csvList = z
@@ -10,6 +11,76 @@ const csvList = z
       .filter((item) => item.length > 0),
   );
 
+/** IP ou CIDR (ex.: 10.0.0.0/8, ::1/128) aceito em TRUST_PROXY. */
+function isIpOrCidr(value: string): boolean {
+  const [address = '', prefix, ...rest] = value.split('/');
+  const version = isIP(address);
+  if (version === 0 || rest.length > 0) return false;
+  if (prefix === undefined) return true;
+  const bits = Number(prefix);
+  return /^\d{1,3}$/.test(prefix) && bits >= 0 && bits <= (version === 4 ? 32 : 128);
+}
+
+/**
+ * TRUST_PROXY decide de onde vem o IP do cliente (usado no rate limit e na auditoria):
+ *  - "false" (padrão): o IP é o da conexão TCP; X-Forwarded-For é ignorado.
+ *  - número N (1 a 10): confia nos N saltos de proxy mais próximos. Com 1 proxy reverso, use 1.
+ *  - lista de IPs/CIDRs: confia apenas nesses proxies.
+ * "true" é RECUSADO: o Fastify passaria a usar o primeiro endereço do X-Forwarded-For, que é
+ * escolhido pelo próprio cliente; qualquer um trocaria de "IP" a cada requisição.
+ */
+const trustProxySchema = z
+  .string()
+  .default('false')
+  .transform((raw, ctx): false | number | string[] => {
+    const value = raw.trim().toLowerCase();
+    if (value === 'false' || value === '') return false;
+    if (value === 'true') {
+      ctx.addIssue({
+        code: 'custom',
+        message: '"true" confia em qualquer X-Forwarded-For; use o número de proxies ou IPs/CIDRs',
+      });
+      return z.NEVER;
+    }
+    if (/^\d+$/.test(value)) {
+      const hops = Number(value);
+      if (hops >= 1 && hops <= 10) return hops;
+      ctx.addIssue({ code: 'custom', message: 'número de proxies deve estar entre 1 e 10' });
+      return z.NEVER;
+    }
+    const entries = value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (entries.length > 0 && entries.every(isIpOrCidr)) return entries;
+    ctx.addIssue({ code: 'custom', message: 'use false, um número de proxies ou IPs/CIDRs' });
+    return z.NEVER;
+  });
+
+const WINDOW_UNIT_MS = { s: 1_000, m: 60_000, h: 3_600_000 } as const;
+
+/**
+ * Política de rate limit no formato "<máximo>/<janela>", ex.: "5/15m", "60/1m", "5/1h".
+ * Janela entre 1 s e 24 h; máximo entre 1 e 100 000.
+ */
+const rateLimitSpec = (fallback: string) =>
+  z
+    .string()
+    .default(fallback)
+    .transform((raw, ctx) => {
+      const match = /^(\d{1,6})\/(\d{1,5})(s|m|h)$/.exec(raw.trim());
+      const max = Number(match?.[1]);
+      const windowMs = Number(match?.[2]) * WINDOW_UNIT_MS[(match?.[3] ?? 's') as 's' | 'm' | 'h'];
+      if (!match || max < 1 || max > 100_000 || windowMs < 1_000 || windowMs > 86_400_000) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'use "<máximo>/<janela>" com janela em s, m ou h (ex.: 5/15m), até 24h',
+        });
+        return z.NEVER;
+      }
+      return { max, windowMs };
+    });
+
 export const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -20,7 +91,7 @@ export const envSchema = z
       .default('info'),
     CORS_ORIGINS: csvList,
     SWAGGER_ENABLED: z.stringbool().default(true),
-    TRUST_PROXY: z.stringbool().default(false),
+    TRUST_PROXY: trustProxySchema,
     DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
     REDIS_URL: z.url({ protocol: /^rediss?$/ }),
     // HS256 com chave curta é quebrável offline a partir de um único token capturado.
@@ -33,6 +104,27 @@ export const envSchema = z
     SESSION_ABSOLUTE_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
     /** Janela em que reapresentar um refresh já rotacionado gera 409 em vez de revogar. */
     REFRESH_REUSE_GRACE_SECONDS: z.coerce.number().int().min(0).max(60).default(10),
+    // --- Rate limiting (Etapa 6) ---
+    /**
+     * Chave do HMAC-SHA256 que pseudonimiza IPs, emails e ids nas chaves do Redis. Precisa ser
+     * ESTÁVEL (trocar zera todos os contadores) e diferente do segredo do JWT.
+     */
+    RATE_LIMIT_HMAC_SECRET: z.string().min(32, 'precisa ter pelo menos 32 caracteres'),
+    /** Namespace das chaves no Redis. Os testes usam um prefixo próprio e aleatório. */
+    RATE_LIMIT_KEY_PREFIX: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9:_-]{0,63}$/i, 'use letras, números, ":", "_" ou "-" (até 64)')
+      .default('authapi:rl'),
+    RATE_LIMIT_LOGIN_IP: rateLimitSpec('5/15m'),
+    RATE_LIMIT_LOGIN_ACCOUNT: rateLimitSpec('10/1h'),
+    RATE_LIMIT_REGISTER_IP: rateLimitSpec('5/1h'),
+    RATE_LIMIT_REFRESH_IP: rateLimitSpec('20/15m'),
+    RATE_LIMIT_LOGOUT_USER: rateLimitSpec('20/15m'),
+    RATE_LIMIT_LOGOUT_ALL_USER: rateLimitSpec('5/15m'),
+    RATE_LIMIT_UPDATE_PROFILE_USER: rateLimitSpec('10/15m'),
+    RATE_LIMIT_ADMIN_USERS: rateLimitSpec('60/1m'),
+    RATE_LIMIT_ADMIN_USER_BY_ID: rateLimitSpec('60/1m'),
+    RATE_LIMIT_ADMIN_AUDIT_EVENTS: rateLimitSpec('30/1m'),
   })
   .superRefine((env, ctx) => {
     if (env.NODE_ENV === 'production' && env.CORS_ORIGINS.includes('*')) {
@@ -40,6 +132,13 @@ export const envSchema = z
         code: 'custom',
         path: ['CORS_ORIGINS'],
         message: 'wildcard "*" não é permitido em produção',
+      });
+    }
+    if (env.RATE_LIMIT_HMAC_SECRET === env.JWT_ACCESS_SECRET) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['RATE_LIMIT_HMAC_SECRET'],
+        message: 'precisa ser diferente de JWT_ACCESS_SECRET',
       });
     }
     if (env.REFRESH_TOKEN_TTL_DAYS > env.SESSION_ABSOLUTE_TTL_DAYS) {

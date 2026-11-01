@@ -3,7 +3,7 @@
 API REST de autenticação e gerenciamento de usuários construída com Node.js, TypeScript,
 Fastify, PostgreSQL e Prisma.
 
-> **Status:** Etapa 5 de 10 (RBAC USER/ADMIN, rotas administrativas somente leitura e trilha de auditoria).
+> **Status:** Etapa 6 de 10 (rate limiting com Redis por IP, conta e usuário; RBAC, auditoria e JWT).
 > O README completo, com arquitetura, modelo de ameaças e roteiro de demonstração, chega na
 > Etapa 10. As decisões técnicas estão em [`docs/architecture.md`](docs/architecture.md).
 
@@ -28,15 +28,19 @@ npm run dev
 - Swagger UI: <http://127.0.0.1:3000/docs>
 - OpenAPI JSON: <http://127.0.0.1:3000/docs/json>
 
-`JWT_ACCESS_SECRET` é obrigatório (mínimo de 32 caracteres) e a API não sobe sem ele. Gere um
-valor só seu e cole no `.env`, que nunca é versionado:
+`JWT_ACCESS_SECRET` e `RATE_LIMIT_HMAC_SECRET` são obrigatórios (mínimo de 32 caracteres cada,
+e diferentes entre si). Sem eles, a API não sobe. Gere um valor para cada um, rodando o comando
+duas vezes, e cole no `.env`, que nunca é versionado:
 
 ```powershell
 node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
 ```
 
-Se você já tinha um `.env` da Etapa 3, rode também `npm run db:migrate:deploy`. A Etapa 4 traz
-uma migration que só acrescenta dados (o valor `EMAIL_CHANGE` ao enum de motivos de revogação).
+Se você já tinha um `.env` de etapas anteriores, rode também `npm run db:migrate:deploy`. As
+migrations das Etapas 4 a 6 só acrescentam valores a enums.
+
+`TRUST_PROXY=true` agora é **recusado** na inicialização (veja [Rate limiting](#rate-limiting)).
+Use `false`, o número de proxies ou a lista de IPs/CIDRs dos proxies.
 
 O PostgreSQL do Docker usa a porta **5433** para não conflitar com um PostgreSQL instalado
 localmente na 5432. As portas são publicadas apenas em `127.0.0.1`.
@@ -184,8 +188,89 @@ Travas do comando:
 - O fluxo completo, as ameaças consideradas e as limitações estão em
   [`docs/architecture.md`](docs/architecture.md#etapa-4-autenticação-e-sessões).
 
-> **Rate limiting** de login, cadastro e refresh chega na **Etapa 6**. Até lá, a defesa contra
-> força bruta é o custo do Argon2id e a trilha de auditoria (`LOGIN_FAILURE`).
+### Rate limiting
+
+Os contadores ficam no **Redis compartilhado**, então o limite vale para todas as instâncias da
+API juntas. Cada contador é atualizado por um script Lua atômico (`INCR` + `PEXPIRE`) e expira
+sozinho com a janela.
+
+| Endpoint                  | Limite padrão | Janela | Por                   | Redis fora do ar |
+| ------------------------- | ------------- | ------ | --------------------- | ---------------- |
+| `POST /auth/login`        | 5             | 15 min | IP                    | 503 (fechado)    |
+| `POST /auth/login`        | 10            | 1 h    | conta (HMAC do email) | 503 (fechado)    |
+| `POST /auth/register`     | 5             | 1 h    | IP                    | 503 (fechado)    |
+| `POST /auth/refresh`      | 20            | 15 min | IP                    | 503 (fechado)    |
+| `POST /auth/logout`       | 20            | 15 min | usuário               | libera (aberto)  |
+| `POST /auth/logout-all`   | 5             | 15 min | usuário               | libera (aberto)  |
+| `PATCH /users/me`         | 10            | 15 min | usuário               | 503 (fechado)    |
+| `GET /admin/users`        | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| `GET /admin/users/:id`    | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| `GET /admin/audit-events` | 30            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+
+`/health`, `/ready`, `/docs` e `GET /users/me` não têm limite. Os valores são **defaults de
+desenvolvimento**: ajuste-os por variável de ambiente (`RATE_LIMIT_LOGIN_IP=5/15m` etc., ver
+`.env.example`) com base em métricas reais de uso.
+
+- **IP e conta no login.** O limite por IP vem primeiro, antes de ler o corpo. O limite por conta
+  (10/h, contando todos os IPs juntos) só é consumido se o de IP passou. Assim, quem distribui
+  tentativas por muitos IPs esbarra na conta, e um único IP já bloqueado não consegue travar a
+  conta de outra pessoa.
+- **Usuário autenticado.** Nas rotas autenticadas, o limite roda **depois** da autenticação. Um
+  anônimo sempre recebe `401`, nunca `429`. Nas rotas admin, o limite roda antes da checagem de
+  papel, o que também contém um USER que insista em rotas admin.
+- **Chaves no Redis:** `authapi:rl:<política>:<escopo>:<HMAC-SHA256>`. IPs, emails e ids nunca
+  aparecem em texto (nem como SHA-256 simples, que seria reversível por dicionário). A chave do
+  HMAC (`RATE_LIMIT_HMAC_SECRET`) é separada do JWT e precisa ser estável.
+- **Redis fora do ar.** Login, cadastro, refresh e `PATCH /users/me` respondem
+  `503 SERVICE_UNAVAILABLE`, com mensagem genérica: nunca `401`, para não parecer credencial
+  inválida. Logout e consultas admin seguem funcionando, pois bloqueá-las não protege nada.
+- **Auditoria.** Um evento `RATE_LIMIT_EXCEEDED` é gravado só no **primeiro** bloqueio de cada
+  chave na janela. Um atacante recebendo milhões de `429` gera no máximo um registro por janela.
+
+**TRUST_PROXY** decide de onde vem o IP:
+
+| Valor                      | Quando usar                                      | X-Forwarded-For                                          |
+| -------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `false` (padrão)           | Desenvolvimento local, API exposta diretamente   | Ignorado: o IP é o da conexão TCP                        |
+| `1`                        | Atrás de **um** proxy reverso (nginx, Caddy, LB) | Só o endereço que o proxy anexou é usado                 |
+| `10.0.0.0/8,172.16.0.0/12` | Proxies com IPs conhecidos                       | Aceito apenas se a conexão vier desses IPs               |
+| `true`                     | **Recusado na inicialização**                    | Usaria o primeiro valor do header, que o cliente escolhe |
+
+Com o padrão `false`, mandar `X-Forwarded-For: 1.2.3.4` não muda nada: o limite continua
+contando o IP real da conexão. Há teste para cada modo.
+
+**Resposta 429** (real, do servidor compilado):
+
+```http
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 5
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 900
+retry-after: 900
+
+{"error":{"code":"RATE_LIMITED","message":"Muitas requisições. Tente novamente em 900 s.","requestId":"c13d1bc1-...","details":{"retryAfterSeconds":900}}}
+```
+
+A mensagem é a mesma para os limites de IP, conta e usuário. A resposta não diz qual limite
+estourou nem se a conta existe. O limite por conta não envia `X-RateLimit-*`: o "remaining" de
+um email revelaria tentativas feitas por terceiros.
+
+**Testar manualmente** (Git Bash ou WSL, com a API em `npm run dev`):
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -w "tentativa $i: %{http_code}\n" -X POST http://127.0.0.1:3000/api/v1/auth/login \
+    -H 'content-type: application/json' -H "x-forwarded-for: 10.0.0.$i" \
+    -d '{"email":"teste@example.com","password":"senha errada porem longa"}'
+done
+# tentativa 1..5: 401 · tentativa 6: 429 (o X-Forwarded-For trocado não ajuda)
+```
+
+No Swagger, execute `POST /api/v1/auth/login` seis vezes: a sexta resposta é `429`, e os
+cabeçalhos aparecem em _Response headers_. Para repetir o teste antes de a janela acabar, apague
+**só** as chaves do ambiente local:
+`docker compose exec redis redis-cli --scan --pattern 'authapi:rl:*' | xargs -r docker compose exec -T redis redis-cli del`.
+Nunca use `FLUSHALL`.
 
 ### Política de senhas
 
@@ -272,6 +357,8 @@ Invoke-RestMethod -Method Post -Uri "$api/auth/logout" -Headers @{ Authorization
 | `REFRESH_TOKEN_ALREADY_ROTATED` | 409    | Token trocado há menos de 10 s: use o par mais recente      |
 | `FORBIDDEN`                     | 403    | Papel sem permissão para o recurso                          |
 | `INVALID_CURRENT_PASSWORD`      | 403    | Senha atual errada na troca de email                        |
+| `RATE_LIMITED`                  | 429    | Limite de requisições excedido: veja `Retry-After`          |
+| `SERVICE_UNAVAILABLE`           | 503    | Proteção contra abuso indisponível (Redis fora do ar)       |
 
 ### Usuários fictícios do seed
 
