@@ -36,6 +36,11 @@ enum AuditEventType {
   TOKEN_REUSE_DETECTED
   ACCESS_DENIED
   RATE_LIMIT_EXCEEDED // primeiro bloqueio (429) de uma chave na janela; nunca um por requisição
+  PROFILE_UPDATED // nome e/ou email alterados (após o commit)
+  PROFILE_UPDATE_DENIED // troca de email recusada: senha atual errada ou email em uso
+  ADMIN_USERS_LISTED // ADMIN consultou a listagem de usuários
+  ADMIN_USER_VIEWED // ADMIN consultou um usuário pelo id
+  ADMIN_AUDIT_QUERIED // ADMIN consultou a trilha de auditoria (um evento por consulta)
 }
 
 enum AlertRule {

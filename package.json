@@ -31,6 +31,7 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
     "admin:promote": "tsx scripts/promote-admin.ts",
+    "audit:retention": "tsx scripts/audit-retention.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {

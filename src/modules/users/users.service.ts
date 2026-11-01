@@ -1,4 +1,5 @@
 import { AppError, conflict, notFound } from '../../shared/errors.js';
+import type { AuditRecorder } from '../audit/audit.recorder.js';
 import { checkPasswordPolicy, PASSWORD_VIOLATION_MESSAGES } from './password-policy.js';
 import { EmailAlreadyInUseError } from './users.repository.js';
 import type {
@@ -15,6 +16,13 @@ export interface UsersServiceDeps {
   usersRepository: UsersRepository;
   hashPassword: HashPassword;
   verifyPassword: VerifyPassword;
+  audit: AuditRecorder;
+}
+
+/** Contexto da alteração de perfil: sessão atual (preservada) e IP para a auditoria. */
+export interface UpdateProfileContext {
+  currentSessionId?: string;
+  ip?: string | null;
 }
 
 export type UsersService = ReturnType<typeof createUsersService>;
@@ -25,7 +33,12 @@ export function createUsersService({
   usersRepository,
   hashPassword,
   verifyPassword,
+  audit,
 }: UsersServiceDeps) {
+  /** Recusa da troca de email: só o motivo, nunca o email tentado nem a senha. */
+  const denyProfileUpdate = (userId: string, ip: string | null | undefined, reason: string) =>
+    audit.record({ type: 'PROFILE_UPDATE_DENIED', userId, ip: ip ?? null, metadata: { reason } });
+
   return {
     /**
      * Cadastro público. O papel é sempre USER: a entrada não tem campo role e o
@@ -72,7 +85,7 @@ export function createUsersService({
     async updateProfile(
       userId: string,
       input: UpdateProfileInput,
-      { currentSessionId }: { currentSessionId?: string } = {},
+      { currentSessionId, ip }: UpdateProfileContext = {},
     ): Promise<PublicUser> {
       const changes: ProfileChanges = {};
       if (input.name !== undefined) changes.name = input.name;
@@ -93,6 +106,8 @@ export function createUsersService({
         const credentials = await usersRepository.findCredentials(userId);
         if (!credentials) throw notFound('Usuário não encontrado');
         if (!(await verifyPassword(credentials.passwordHash, input.currentPassword))) {
+          // Sinal relevante: alguém com um token tentando trocar o email sem saber a senha.
+          await denyProfileUpdate(userId, ip, 'INVALID_CURRENT_PASSWORD');
           throw new AppError(403, 'INVALID_CURRENT_PASSWORD', 'Senha atual incorreta');
         }
         emailChanged = credentials.email !== changes.email;
@@ -105,9 +120,23 @@ export function createUsersService({
           emailChanged ? { revokeOtherSessions: { keepSessionId: currentSessionId } } : {},
         );
         if (!user) throw notFound('Usuário não encontrado');
+        // Só depois do commit da transação (UPDATE + revogação das outras sessões).
+        await audit.record({
+          type: 'PROFILE_UPDATED',
+          userId,
+          ip: ip ?? null,
+          metadata: {
+            fields: Object.keys(changes).sort().join(','),
+            emailChanged,
+            otherSessionsRevoked: emailChanged,
+          },
+        });
         return user;
       } catch (error) {
-        if (error instanceof EmailAlreadyInUseError) throw conflict(EMAIL_CONFLICT_MESSAGE);
+        if (error instanceof EmailAlreadyInUseError) {
+          await denyProfileUpdate(userId, ip, 'EMAIL_IN_USE');
+          throw conflict(EMAIL_CONFLICT_MESSAGE);
+        }
         throw error;
       }
     },

@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPrismaClient, type PrismaClient } from '../../src/infra/prisma.js';
 import { buildTestApp } from '../helpers/build-test-app.js';
 import { TEST_DATABASE_URL } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 const DOMAIN = '@logs-test.example.com';
 const PASSWORD = 'frase secreta que nunca pode ir para o log';
@@ -18,7 +19,7 @@ let prisma: PrismaClient;
 const lines: string[] = [];
 
 async function cleanup() {
-  await prisma.auditEvent.deleteMany({ where: { user: { email: { endsWith: DOMAIN } } } });
+  await purgeAuditEvents(prisma, { where: { user: { email: { endsWith: DOMAIN } } } });
   await prisma.user.deleteMany({ where: { email: { endsWith: DOMAIN } } });
 }
 

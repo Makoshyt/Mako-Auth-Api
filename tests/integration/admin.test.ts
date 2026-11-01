@@ -5,6 +5,7 @@ import { createAccessTokenSigner } from '../../src/modules/auth/tokens.js';
 import type { ErrorBody } from '../../src/shared/error-handler.js';
 import { buildTestApp } from '../helpers/build-test-app.js';
 import { TEST_DATABASE_URL, TEST_JWT_SECRET } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 /** Todos os dados usam este domínio fictício e são removidos antes e depois. */
 const DOMAIN = '@admin-test.example.com';
@@ -79,7 +80,7 @@ const scoped = (query: string) =>
   `/api/v1/admin/users?email=${encodeURIComponent(DOMAIN)}${query ? `&${query}` : ''}`;
 
 async function cleanup() {
-  await prisma.auditEvent.deleteMany({ where: { user: { email: { endsWith: DOMAIN } } } });
+  await purgeAuditEvents(prisma, { where: { user: { email: { endsWith: DOMAIN } } } });
   await prisma.user.deleteMany({ where: { email: { endsWith: DOMAIN } } });
 }
 

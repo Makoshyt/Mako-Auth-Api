@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPrismaClient, type PrismaClient } from '../../src/infra/prisma.js';
 import { TEST_DATABASE_URL } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 /**
  * Verifica, no PostgreSQL real, as restrições da migration init:
@@ -15,7 +16,7 @@ let prisma: PrismaClient;
 
 async function cleanup(): Promise<void> {
   await prisma.securityAlert.deleteMany({ where: { fingerprint: { startsWith: 'db-test:' } } });
-  await prisma.auditEvent.deleteMany({
+  await purgeAuditEvents(prisma, {
     where: { metadata: { path: ['suite'], equals: 'db-test' } },
   });
   await prisma.user.deleteMany({ where: { email: { endsWith: DOMAIN } } });

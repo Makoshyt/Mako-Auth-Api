@@ -8,6 +8,7 @@ import { createAccessTokenSigner } from '../../src/modules/auth/tokens.js';
 import type { ErrorBody } from '../../src/shared/error-handler.js';
 import { buildTestApp } from '../helpers/build-test-app.js';
 import { TEST_DATABASE_URL, TEST_JWT_SECRET } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 /** Todos os dados usam este domínio fictício e são removidos antes e depois. */
 const DOMAIN = '@auth-test.example.com';
@@ -62,7 +63,7 @@ const sessionIdOf = (accessToken: string) =>
   ).sid;
 
 async function cleanup() {
-  await prisma.auditEvent.deleteMany({
+  await purgeAuditEvents(prisma, {
     where: {
       OR: [{ user: { email: { endsWith: DOMAIN } } }, { emailHash: hashEmail(UNKNOWN_EMAIL) }],
     },

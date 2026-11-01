@@ -11,6 +11,7 @@ import type { ErrorBody } from '../../src/shared/error-handler.js';
 import { hashPassword, verifyPassword } from '../../src/shared/password-hasher.js';
 import { buildTestApp, type BuildTestAppOptions } from '../helpers/build-test-app.js';
 import { TEST_DATABASE_URL } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 /** Dados fictícios: domínio próprio e IPs da faixa de documentação 192.0.2.0/24 (RFC 5737). */
 const DOMAIN = '@reset-test.example.com';
@@ -64,7 +65,7 @@ async function requestToken(local: string, target = app): Promise<string> {
 }
 
 async function cleanupDb() {
-  await prisma.auditEvent.deleteMany({
+  await purgeAuditEvents(prisma, {
     where: {
       OR: [
         { user: { email: { endsWith: DOMAIN } } },

@@ -214,6 +214,8 @@ describe('UsersService com repositório Prisma (PostgreSQL real)', () => {
       usersRepository: createUsersRepository(prisma),
       hashPassword,
       verifyPassword,
+      // Este bloco testa a persistência do perfil; a auditoria é verificada em audit.test.ts.
+      audit: { record: () => Promise.resolve() },
     });
 
   it('getProfile retorna o perfil persistido, sem passwordHash', async () => {

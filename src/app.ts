@@ -104,14 +104,16 @@ export async function buildApp({
   if (env.SWAGGER_ENABLED) await registerSwagger(app);
 
   // Montagem manual das dependências: repository -> service -> rotas.
+
+  // Falhas de auditoria vão só para o log; o cliente nunca vê o detalhe (nem recebe 500).
+  const audit = createAuditRecorder(prisma, (error) => {
+    app.log.error({ err: error }, 'falha ao gravar evento de auditoria');
+  });
   const usersService = createUsersService({
     usersRepository: createUsersRepository(prisma),
     hashPassword,
     verifyPassword,
-  });
-  // Falhas de auditoria vão só para o log; o cliente nunca vê o detalhe (nem recebe 500).
-  const audit = createAuditRecorder(prisma, (error) => {
-    app.log.error({ err: error }, 'falha ao gravar evento de auditoria');
+    audit,
   });
   const authService = createAuthService({
     authRepository: createAuthRepository(prisma),
@@ -126,7 +128,10 @@ export async function buildApp({
     },
   });
 
-  const adminService = createAdminService({ adminRepository: createAdminRepository(prisma) });
+  const adminService = createAdminService({
+    adminRepository: createAdminRepository(prisma),
+    audit,
+  });
 
   // Erros de tarefas em segundo plano vão só para o log (sem token nem email: só a mensagem).
   const backgroundTasks = createBackgroundTasks((name, error) => {

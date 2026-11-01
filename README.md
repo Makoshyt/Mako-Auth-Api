@@ -3,7 +3,7 @@
 API REST de autenticação e gerenciamento de usuários construída com Node.js, TypeScript,
 Fastify, PostgreSQL e Prisma.
 
-> **Status:** Etapa 7 de 10 (recuperação de senha por link de uso único; rate limiting, RBAC, auditoria e JWT).
+> **Status:** Etapa 8 de 10 (auditoria completa e append-only, com retenção controlada; recuperação de senha, rate limiting, RBAC e JWT).
 > O README completo, com arquitetura, modelo de ameaças e roteiro de demonstração, chega na
 > Etapa 10. As decisões técnicas estão em [`docs/architecture.md`](docs/architecture.md).
 
@@ -277,6 +277,44 @@ cabeçalhos aparecem em _Response headers_. Para repetir o teste antes de a jane
 `docker compose exec redis redis-cli --scan --pattern 'authapi:rl:*' | xargs -r docker compose exec -T redis redis-cli del`.
 Nunca use `FLUSHALL`.
 
+### Auditoria
+
+Toda ação sensível gera **um** evento em `audit_events`, gravado **depois** de a ação ser
+confirmada. Só o ADMIN consulta a trilha, em `GET /api/v1/admin/audit-events`.
+
+| Evento                   | Quando                                                     | Metadados (nunca senha, token ou email em texto)          |
+| ------------------------ | ---------------------------------------------------------- | --------------------------------------------------------- |
+| `LOGIN_SUCCESS`          | Login aceito                                               | `sessionId`                                               |
+| `LOGIN_FAILURE`          | Senha errada ou email inexistente                          | `reason`                                                  |
+| `LOGOUT` / `LOGOUT_ALL`  | Encerramento de uma sessão ou de todas                     | `sessionId` / `revokedSessions`                           |
+| `TOKEN_REUSE_DETECTED`   | Refresh token reutilizado fora da janela (sessão revogada) | `sessionId`, `secondsSinceRotation`                       |
+| `PROFILE_UPDATED`        | Nome e/ou email alterados                                  | `fields`, `emailChanged`, `otherSessionsRevoked`          |
+| `PROFILE_UPDATE_DENIED`  | Troca de email recusada                                    | `reason` (`INVALID_CURRENT_PASSWORD`, `EMAIL_IN_USE`)     |
+| `PASSWORD_RESET_REQUEST` | Pedido de recuperação (conta existente ou não)             | `outcome`                                                 |
+| `PASSWORD_RESET_SUCCESS` | Senha redefinida                                           | `revokedSessions`                                         |
+| `ACCESS_DENIED`          | 403 por papel insuficiente                                 | `method`, `route` (padrão), `requiredRoles`, `role`       |
+| `RATE_LIMIT_EXCEEDED`    | Primeiro 429 de uma chave na janela                        | `policy`, `scope`, `limit`, `windowSeconds`               |
+| `ADMIN_USERS_LISTED`     | ADMIN listou usuários                                      | paginação, `role`, `emailFilter` (sim/não), `resultCount` |
+| `ADMIN_USER_VIEWED`      | ADMIN consultou um usuário (inclusive 404)                 | `targetUserId`, `found`                                   |
+| `ADMIN_AUDIT_QUERIED`    | ADMIN consultou a auditoria                                | paginação, filtros usados, `resultCount`                  |
+
+- **Privacidade:** o email entra só como SHA-256 (`emailHash`), que a API não devolve. O
+  trecho pesquisado no filtro de email do ADMIN não é guardado. Os IPs são guardados para
+  investigar abuso.
+- **Append-only no banco:** um trigger recusa `UPDATE` e `DELETE` em `audit_events`. A única
+  exceção é a rotina de retenção, e não existe endpoint de edição ou exclusão.
+- **Retenção:** 180 dias para eventos comuns e 365 para sinais de ataque e responsabilização.
+  A rotina é **manual** e só simula por padrão:
+
+```powershell
+npm run audit:retention                                         # simulação: só conta
+$env:AUDIT_RETENTION_ENABLED='true'; npm run audit:retention -- --execute --confirm <nome-do-banco>
+```
+
+Fora de produção, a exclusão só roda em bancos `*_test`: o banco de desenvolvimento nunca é
+apagado. Detalhes, limitações e riscos em
+[`docs/architecture.md`](docs/architecture.md#etapa-8-auditoria-avançada).
+
 ### Recuperação de senha
 
 1. `POST /api/v1/auth/forgot-password` com `{"email": "..."}` responde **sempre `202`** com a
@@ -446,23 +484,24 @@ tinha `ada.admin@example.com` como ADMIN (seed da Etapa 2), ela continua ADMIN.
 
 ## Scripts
 
-| Comando                                              | O que faz                                                         |
-| ---------------------------------------------------- | ----------------------------------------------------------------- |
-| `npm run dev`                                        | Servidor com reload automático (tsx watch)                        |
-| `npm run build`                                      | Compila para `dist/`                                              |
-| `npm start`                                          | Executa o build compilado                                         |
-| `npm run lint`                                       | ESLint com regras type-checked                                    |
-| `npm run typecheck`                                  | Checagem de tipos sem emitir arquivos                             |
-| `npm run format` / `format:check`                    | Prettier                                                          |
-| `npm test`                                           | Todos os testes (a integração exige `npm run docker:up`)          |
-| `npm run test:unit`                                  | Apenas testes unitários (sem Docker)                              |
-| `npm run test:integration`                           | Apenas integração (banco `authapi_test` e Redis)                  |
-| `npm run test:coverage`                              | Testes com relatório de cobertura                                 |
-| `npm run docker:up`                                  | Sobe PostgreSQL e Redis e espera os healthchecks                  |
-| `npm run docker:stop`                                | Para os containers (os dados nos volumes são mantidos)            |
-| `npm run db:migrate`                                 | Cria/aplica migrations em desenvolvimento (`prisma migrate dev`)  |
-| `npm run db:migrate:deploy`                          | Aplica migrations pendentes sem gerar novas (CI/produção)         |
-| `npm run db:seed`                                    | Popula o banco de desenvolvimento com dados fictícios             |
-| `npm run admin:promote -- --email <e> --confirm <e>` | Promove um usuário fictício local a ADMIN (bloqueado em produção) |
-| `npm run db:studio`                                  | Abre o Prisma Studio                                              |
-| `npm run db:generate`                                | Regenera o Prisma Client após mudar o schema                      |
+| Comando                                                    | O que faz                                                                        |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `npm run dev`                                              | Servidor com reload automático (tsx watch)                                       |
+| `npm run build`                                            | Compila para `dist/`                                                             |
+| `npm start`                                                | Executa o build compilado                                                        |
+| `npm run lint`                                             | ESLint com regras type-checked                                                   |
+| `npm run typecheck`                                        | Checagem de tipos sem emitir arquivos                                            |
+| `npm run format` / `format:check`                          | Prettier                                                                         |
+| `npm test`                                                 | Todos os testes (a integração exige `npm run docker:up`)                         |
+| `npm run test:unit`                                        | Apenas testes unitários (sem Docker)                                             |
+| `npm run test:integration`                                 | Apenas integração (banco `authapi_test` e Redis)                                 |
+| `npm run test:coverage`                                    | Testes com relatório de cobertura                                                |
+| `npm run docker:up`                                        | Sobe PostgreSQL e Redis e espera os healthchecks                                 |
+| `npm run docker:stop`                                      | Para os containers (os dados nos volumes são mantidos)                           |
+| `npm run db:migrate`                                       | Cria/aplica migrations em desenvolvimento (`prisma migrate dev`)                 |
+| `npm run db:migrate:deploy`                                | Aplica migrations pendentes sem gerar novas (CI/produção)                        |
+| `npm run db:seed`                                          | Popula o banco de desenvolvimento com dados fictícios                            |
+| `npm run admin:promote -- --email <e> --confirm <e>`       | Promove um usuário fictício local a ADMIN (bloqueado em produção)                |
+| `npm run audit:retention [-- --execute --confirm <banco>]` | Retenção da auditoria: simula por padrão; apagar exige habilitação e confirmação |
+| `npm run db:studio`                                        | Abre o Prisma Studio                                                             |
+| `npm run db:generate`                                      | Regenera o Prisma Client após mudar o schema                                     |

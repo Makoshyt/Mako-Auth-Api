@@ -1,6 +1,7 @@
+import type { FastifyRequest } from 'fastify';
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
 import { bearerAuth, errorResponseSchema, rateLimitResponses } from '../../shared/http-schemas.js';
-import { requireRole } from '../auth/auth.middleware.js';
+import { authOf, clientInfo, requireRole } from '../auth/auth.middleware.js';
 import { publicUserSchema, toPublicUserDto } from '../users/users.schemas.js';
 import {
   auditEventListSchema,
@@ -11,11 +12,17 @@ import {
   userIdParamsSchema,
   userListSchema,
 } from './admin.schemas.js';
-import type { AdminService } from './admin.service.js';
+import type { AdminActor, AdminService } from './admin.service.js';
 
 interface AdminRoutesOptions {
   adminService: AdminService;
 }
+
+/** O ADMIN da requisição, derivado do token e do IP da conexão. */
+const actorOf = (request: FastifyRequest): AdminActor => ({
+  userId: authOf(request).userId,
+  ip: clientInfo(request).ip,
+});
 
 const protectedResponses = {
   400: errorResponseSchema.describe('Parâmetros inválidos'),
@@ -64,7 +71,7 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
       },
     },
     async (request) => {
-      const page = await adminService.listUsers(request.query);
+      const page = await adminService.listUsers(request.query, actorOf(request));
       return toUserListDto(page, request.query);
     },
   );
@@ -85,7 +92,8 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
         },
       },
     },
-    async (request) => toPublicUserDto(await adminService.getUser(request.params.id)),
+    async (request) =>
+      toPublicUserDto(await adminService.getUser(request.params.id, actorOf(request))),
   );
 
   app.get(
@@ -104,7 +112,7 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
       },
     },
     async (request) => {
-      const page = await adminService.listAuditEvents(request.query);
+      const page = await adminService.listAuditEvents(request.query, actorOf(request));
       return toAuditEventListDto(page, request.query);
     },
   );

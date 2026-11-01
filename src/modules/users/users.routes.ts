@@ -1,6 +1,6 @@
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
 import { bearerAuth, errorResponseSchema, failClosedResponses } from '../../shared/http-schemas.js';
-import { authOf } from '../auth/auth.middleware.js';
+import { authOf, clientInfo } from '../auth/auth.middleware.js';
 import {
   publicUserSchema,
   registerBodySchema,
@@ -99,6 +99,7 @@ export const usersRoutes: FastifyPluginAsyncZod<UsersRoutesOptions> = async (app
       const auth = authOf(request);
       const user = await usersService.updateProfile(auth.userId, request.body, {
         currentSessionId: auth.sessionId,
+        ip: clientInfo(request).ip,
       });
       return toPublicUserDto(user);
     },

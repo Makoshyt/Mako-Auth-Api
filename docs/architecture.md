@@ -1,6 +1,6 @@
 # Arquitetura e decisões técnicas
 
-> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 7 (recuperação de senha)**.
+> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 8 (auditoria avançada)**.
 
 ## Visão geral
 
@@ -508,7 +508,7 @@ O `AuditRecorder` da Etapa 4 é a única porta de escrita na tabela `audit_event
 - **Falhas da auditoria** não derrubam a requisição nem vazam detalhes: o erro vai só para o
   log do servidor (há teste unitário com um erro simulado de conexão).
 
-### Política de retenção (definida; exclusão ainda NÃO implementada)
+### Política de retenção (implementada na Etapa 8; ver adiante)
 
 | Dados                                                | Retenção proposta                      |
 | ---------------------------------------------------- | -------------------------------------- |
@@ -540,7 +540,7 @@ antigos não são alterados.
 
 ### Limitações e riscos conhecidos
 
-- **Leituras administrativas não são auditadas.** Um ADMIN pode listar todos os usuários sem
+- ~~Leituras administrativas não são auditadas~~: resolvido na Etapa 8. Texto original: Um ADMIN pode listar todos os usuários sem
   deixar rastro em `audit_events` (só no log de requisições, sem query string). Registrar
   `ADMIN_READ` exige um novo tipo de evento e uma decisão sobre volume.
 - **Promoções feitas pelo comando local não são auditadas**, porque o comando é só para
@@ -913,3 +913,168 @@ acesso. O usuário precisa entrar de novo, porque o reset não emite tokens.
 - **Alteração de senha autenticada** (sabendo a senha atual) não faz parte desta etapa.
 - Tokens consumidos ou expirados continuam na tabela. O expurgo segue a política de retenção da
   Etapa 5.
+
+## Etapa 8: auditoria avançada
+
+### Inventário (antes desta etapa)
+
+| Evento                   | Definido no schema | Emitido?          | Origem                                                                                           |
+| ------------------------ | ------------------ | ----------------- | ------------------------------------------------------------------------------------------------ |
+| `LOGIN_SUCCESS`          | sim                | sim               | `auth.service.ts` → `login`                                                                      |
+| `LOGIN_FAILURE`          | sim                | sim (2 pontos)    | `auth.service.ts` → `login` (email inexistente, senha errada)                                    |
+| `LOGOUT`                 | sim                | sim               | `auth.service.ts` → `logout` (só se a sessão estava ativa)                                       |
+| `LOGOUT_ALL`             | sim                | sim               | `auth.service.ts` → `logoutAll`                                                                  |
+| `TOKEN_REUSE_DETECTED`   | sim                | sim               | `auth.service.ts` → `handleReuse`                                                                |
+| `PASSWORD_RESET_REQUEST` | sim                | sim (2 desfechos) | `password-reset.service.ts` → `issueToken`                                                       |
+| `PASSWORD_RESET_SUCCESS` | sim                | sim               | `password-reset.service.ts` → `resetPassword`                                                    |
+| `ACCESS_DENIED`          | sim                | sim               | `auth.middleware.ts` → `requireRole`                                                             |
+| `RATE_LIMIT_EXCEEDED`    | sim                | sim               | `rate-limiter.ts` → `enforce`                                                                    |
+| `EMAIL_CHANGE`           | **não é evento**   | —                 | Existia só como `SessionRevokeReason`: a troca de email (e de nome) **não gerava nenhum evento** |
+| Leituras administrativas | não                | **não**           | Listar usuários, ver um usuário e consultar a auditoria não deixavam rastro                      |
+
+Todos os 9 tipos definidos já eram emitidos, cada um num ponto único. As lacunas eram as
+alterações de perfil e as leituras administrativas.
+
+### Novos eventos (migration aditiva)
+
+| Evento                  | Origem                                 | Quando é gravado                                                     | Metadados                                                                                  |
+| ----------------------- | -------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `PROFILE_UPDATED`       | `users.service.ts` → `updateProfile`   | Depois do commit (UPDATE + revogação das outras sessões)             | `fields` (nomes, não valores), `emailChanged`, `otherSessionsRevoked`                      |
+| `PROFILE_UPDATE_DENIED` | `users.service.ts` → `updateProfile`   | Senha atual errada (403) ou email já usado (409)                     | `reason`                                                                                   |
+| `ADMIN_USERS_LISTED`    | `admin.service.ts` → `listUsers`       | Depois da leitura                                                    | `page`, `pageSize`, `sort`, `order`, `role?`, `emailFilter` (booleano), `resultCount`      |
+| `ADMIN_USER_VIEWED`     | `admin.service.ts` → `getUser`         | Depois da leitura, **inclusive 404** (sondar ids também é relevante) | `targetUserId`, `found`                                                                    |
+| `ADMIN_AUDIT_QUERIED`   | `admin.service.ts` → `listAuditEvents` | Depois da leitura                                                    | `page`, `pageSize`, `order`, `filterType?`, `targetUserId?`, `from?`, `to?`, `resultCount` |
+
+Não geram evento, de propósito:
+
+- requisições recusadas pela validação (400), que não chegam ao handler;
+- `401` de anônimos, que seriam um vetor barato de inflar a tabela;
+- logout repetido de sessão já encerrada;
+- refresh bem-sucedido (alto volume e baixo valor; o reuso já é auditado).
+
+O encerramento de sessões já estava coberto por `LOGOUT`, `LOGOUT_ALL`, `TOKEN_REUSE_DETECTED`,
+`PASSWORD_RESET_SUCCESS` (`revokedSessions`) e agora `PROFILE_UPDATED`
+(`otherSessionsRevoked`). Os eventos de recuperação de senha também já existiam e foram
+reaproveitados.
+
+### Regras de gravação
+
+- **Só depois da confirmação.** Os eventos de sucesso são gravados depois de a transação
+  correspondente terminar. Testes com falha injetada no meio da transação (troca de email e
+  reset de senha) verificam que nenhum evento de sucesso é gravado. Teste de mutação: gravar
+  `PROFILE_UPDATED` antes da transação fez 4 testes falharem.
+- **Um evento por ação.** A matriz ponta a ponta confere a sequência exata de tipos por usuário.
+- **Best effort, isolado da resposta.** Uma falha ao gravar a auditoria não derruba a ação nem
+  vaza detalhes: o cliente recebe a resposta normal e o erro vai só para o log. Há teste com o
+  `auditEvent.create` falhando, em que login, consulta admin e PATCH respondem 200. O
+  trade-off: uma ação pode ocorrer sem registro se o banco aceitar a ação e recusar a
+  auditoria (ver limitações).
+- **Sem recursão nem amplificação na consulta.** `ADMIN_AUDIT_QUERIED` é gravado **depois** da
+  leitura, então nunca aparece no próprio resultado. Cada consulta gera exatamente um evento,
+  nunca um por item retornado. Testado: 3 consultas seguidas filtrando o próprio tipo
+  devolveram totais 0, 1 e 2. Teste de mutação: gravar antes da leitura fez 3 testes falharem.
+  O volume é limitado pelo rate limit por ADMIN (30/min).
+
+### Privacidade
+
+- **Nunca gravados:** senhas, hashes de senha, JWTs, refresh tokens, tokens de recuperação,
+  header `Authorization`, valores de campos alterados (nome e email novos) e o trecho pesquisado
+  no filtro de email. Há teste que percorre um fluxo completo e busca cada segredo em todos os
+  eventos gerados.
+- **Email:** só como `emailHash` (SHA-256), que a API administrativa não devolve.
+- **Identificadores:** UUIDs (`userId`, `targetUserId`, `sessionId`) são pseudônimos. O
+  `ACCESS_DENIED` grava o **padrão** da rota, sem ids nem query string.
+- **IP:** gravado, porque é necessário para investigar abuso, e limitado pela retenção.
+
+### Integridade dos registros
+
+**Estratégia adotada: append-only garantido pelo banco**, via trigger `audit_events_guard`
+(migration `20261101180100_audit_append_only_guard`):
+
+| Operação   | Comportamento                                                                                                                                                      |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `INSERT`   | Livre (é como a aplicação grava)                                                                                                                                   |
+| `UPDATE`   | **Recusado.** Única exceção: o `ON DELETE SET NULL` da FK de usuário, reconhecido por mudar **somente** `user_id` para `NULL`. Excluir uma conta preserva a trilha |
+| `DELETE`   | Recusado, salvo numa transação que executou `set_config('authapi.audit_purge', 'on', true)`. Isso só acontece em `deleteAuditEvents`, usado pela retenção          |
+| `TRUNCATE` | Recusado nas mesmas condições                                                                                                                                      |
+
+Testado via Prisma:
+
+- `update`, `delete` e `deleteMany` são recusados;
+- a flag vale só dentro da própria transação;
+- excluir um usuário mantém os eventos dele com `user_id = NULL`.
+
+Não existe endpoint de edição ou exclusão da auditoria.
+
+**Limitações:**
+
+- O dono do banco (hoje o mesmo usuário da aplicação) ou um superusuário pode desabilitar o
+  trigger, ligar a flag ou apagar a tabela. O controle protege contra erros e código da
+  aplicação, **não** contra quem tem acesso administrativo ao banco ou contra um invasor com
+  as credenciais da aplicação.
+- Não há prova criptográfica de que nenhum evento foi removido ou inserido fora de ordem.
+- **Evoluções possíveis**, sem complexidade agora:
+  - um usuário de banco separado só com `INSERT`/`SELECT` em `audit_events`, com o dono das
+    tabelas fora da aplicação;
+  - exportação periódica para armazenamento imutável (WORM / object lock);
+  - encadeamento de hashes (cada evento guarda o hash do anterior), com âncora externa.
+
+### Retenção
+
+`src/modules/audit/audit-retention.ts` e o comando `npm run audit:retention`:
+
+| Item             | Valor                                                                                                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prazo padrão     | `AUDIT_RETENTION_DAYS` = 180                                                                                                                                        |
+| Prazo estendido  | `AUDIT_RETENTION_EXTENDED_DAYS` = 365, para `TOKEN_REUSE_DETECTED`, `ACCESS_DENIED`, `RATE_LIMIT_EXCEEDED`, `PASSWORD_RESET_SUCCESS`, `PROFILE_UPDATED` e `ADMIN_*` |
+| Lotes            | `AUDIT_RETENTION_BATCH_SIZE` = 1000 por transação curta, até `AUDIT_RETENTION_MAX_BATCHES` = 100 por execução (os mais antigos primeiro). Exit 3 se sobrar          |
+| Agendamento      | **Nenhum.** A execução é manual e controlada (cron externo, se e quando desejado)                                                                                   |
+| Padrão           | **Simulação**: conta os vencidos e não apaga nada                                                                                                                   |
+| Para apagar      | `AUDIT_RETENTION_ENABLED=true` + `--execute` + `--confirm <nome do banco>`                                                                                          |
+| Fora de produção | A exclusão só roda em bancos `*_test`. O banco de desenvolvimento é preservado (há teste)                                                                           |
+
+Testado com eventos fictícios retroativos:
+
+- a simulação conta 3 vencidos e não apaga nada;
+- a execução apaga só os vencidos e preserva o evento estendido de 200 dias;
+- lote de 1 com teto de 2 apaga 2 e informa `complete: false`;
+- prazos maiores não apagam nada;
+- o CLI recusa a execução sem habilitação ou com confirmação errada, e executa com ambas.
+
+Nesta etapa, a simulação rodou contra o banco de testes (0 vencidos). **Nenhuma exclusão foi
+executada no banco de desenvolvimento.** Os prazos continuam sendo uma proposta técnica a
+revisar conforme a LGPD.
+
+### Consulta administrativa (revisão)
+
+`GET /api/v1/admin/audit-events` continua só para ADMIN:
+
+- hooks do plugin, nesta ordem: `authenticate`, rate limit 30/min, `requireRole`;
+- paginação de 1 a 100 com teto de página e ordenação estável (`createdAt`, `id`);
+- filtros validados por Zod: `type` (inclui os novos tipos), `userId`, `from`/`to`;
+- resposta sem `emailHash`.
+
+Novidade: cada consulta é auditada (`ADMIN_AUDIT_QUERIED`), sem recursão. Exportação em massa
+não foi implementada.
+
+### Testes adaptados (e por quê)
+
+| Mudança                                                               | Motivo                                                                           | Garantia preservada                                                                      |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| 6 suítes trocam `prisma.auditEvent.deleteMany` por `purgeAuditEvents` | O trigger agora recusa exclusões diretas. O helper usa a mesma porta da retenção | Nenhuma asserção alterada; a limpeza continua restrita aos dados fictícios de cada suíte |
+| `createUsersService` e `createAdminService` recebem `audit`           | Nova dependência obrigatória (injeção explícita)                                 | Os testes antigos passam um gravador falso; os novos verificam os eventos                |
+
+### Riscos pendentes
+
+- **Auditoria best effort:** se o banco aceitar a ação e recusar o `INSERT` do evento, a ação
+  fica sem registro (só no log). Gravar o evento na mesma transação eliminaria isso, ao custo de
+  derrubar a ação quando a auditoria falhar.
+- **A trilha está no mesmo banco** e com as mesmas credenciais da aplicação (ver limitações de
+  integridade).
+- **Volume:** um ADMIN gera até 30 `ADMIN_AUDIT_QUERIED` e 60 de cada consulta de usuário por
+  minuto. Aceitável, mas a retenção precisa ser executada periodicamente.
+- **Refresh bem-sucedido não é auditado.** Só o reuso é. A correlação fina de sessões depende
+  do `last_used_at`.
+- **IP é dado pessoal** visível ao ADMIN. A política de retenção e a base legal precisam ser
+  validadas juridicamente.
+- O motor de alertas que consome estes eventos é a Etapa 9.

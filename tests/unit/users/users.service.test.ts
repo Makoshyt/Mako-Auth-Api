@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createUsersService, type UsersService } from '../../../src/modules/users/users.service.js';
+import type { AuditEventInput } from '../../../src/modules/audit/audit.recorder.js';
 import type { RegisterInput, UpdateProfileInput } from '../../../src/modules/users/users.types.js';
 import { AppError } from '../../../src/shared/errors.js';
 import { InMemoryUsersRepository } from '../../helpers/in-memory-users-repository.js';
@@ -36,14 +37,22 @@ async function expectAppError(promise: Promise<unknown>, statusCode: number, cod
 let repository: InMemoryUsersRepository;
 let service: UsersService;
 let hashPassword: ReturnType<typeof vi.fn<typeof fakeHash>>;
+let events: AuditEventInput[];
 
 beforeEach(() => {
   repository = new InMemoryUsersRepository();
   hashPassword = vi.fn(fakeHash);
+  events = [];
   service = createUsersService({
     usersRepository: repository,
     hashPassword,
     verifyPassword: fakeVerify,
+    audit: {
+      record: (event) => {
+        events.push(event);
+        return Promise.resolve();
+      },
+    },
   });
 });
 
@@ -261,5 +270,92 @@ describe('UsersService.updateProfile', () => {
       404,
       'NOT_FOUND',
     );
+  });
+});
+
+describe('UsersService: auditoria de perfil', () => {
+  const ip = '203.0.113.5';
+
+  it('PROFILE_UPDATED depois de gravar, com os campos e sem os valores', async () => {
+    const created = await service.register(input);
+
+    await service.updateProfile(
+      created.id,
+      { name: 'Bruno Novo', email: 'bruno.novo@example.com', currentPassword: input.password },
+      { currentSessionId: 's1', ip },
+    );
+
+    expect(events).toEqual([
+      {
+        type: 'PROFILE_UPDATED',
+        userId: created.id,
+        ip,
+        metadata: { fields: 'email,name', emailChanged: true, otherSessionsRevoked: true },
+      },
+    ]);
+    const stored = JSON.stringify(events);
+    expect(stored).not.toContain('bruno.novo@example.com');
+    expect(stored).not.toContain('Bruno Novo');
+    expect(stored).not.toContain(input.password);
+  });
+
+  it('só o nome: emailChanged false e nenhuma sessão revogada', async () => {
+    const created = await service.register(input);
+
+    await service.updateProfile(created.id, { name: 'Bruno L.' }, { ip });
+
+    expect(events.at(-1)?.metadata).toEqual({
+      fields: 'name',
+      emailChanged: false,
+      otherSessionsRevoked: false,
+    });
+  });
+
+  it('senha atual errada: PROFILE_UPDATE_DENIED e nenhum PROFILE_UPDATED', async () => {
+    const created = await service.register(input);
+
+    await service
+      .updateProfile(
+        created.id,
+        { email: 'x@example.com', currentPassword: 'senha errada longa' },
+        { ip },
+      )
+      .catch(() => undefined);
+
+    expect(events).toEqual([
+      {
+        type: 'PROFILE_UPDATE_DENIED',
+        userId: created.id,
+        ip,
+        metadata: { reason: 'INVALID_CURRENT_PASSWORD' },
+      },
+    ]);
+    expect(JSON.stringify(events)).not.toContain('x@example.com');
+  });
+
+  it('email em uso: PROFILE_UPDATE_DENIED (EMAIL_IN_USE) e nenhum PROFILE_UPDATED', async () => {
+    const bruno = await service.register(input);
+    await service.register({ ...input, email: 'carla@example.com', name: 'Carla Dias' });
+
+    await service
+      .updateProfile(
+        bruno.id,
+        { email: 'carla@example.com', currentPassword: input.password },
+        { ip },
+      )
+      .catch(() => undefined);
+
+    expect(events.map((e) => [e.type, e.metadata])).toEqual([
+      ['PROFILE_UPDATE_DENIED', { reason: 'EMAIL_IN_USE' }],
+    ]);
+  });
+
+  it('validação recusada antes de qualquer gravação não gera evento', async () => {
+    const created = await service.register(input);
+
+    await service.updateProfile(created.id, {}).catch(() => undefined);
+    await service.updateProfile(created.id, { email: 'novo@example.com' }).catch(() => undefined);
+
+    expect(events).toEqual([]);
   });
 });

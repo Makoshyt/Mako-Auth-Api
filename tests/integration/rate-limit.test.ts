@@ -11,6 +11,7 @@ import {
   type BuildTestAppOptions,
 } from '../helpers/build-test-app.js';
 import { TEST_DATABASE_URL, TEST_RATE_LIMIT_ROOT, TEST_REDIS_URL } from '../helpers/test-env.js';
+import { purgeAuditEvents } from '../helpers/purge-audit-events.js';
 
 /**
  * Rate limit com os DEFAULTS DE PRODUÇÃO, contra Redis e PostgreSQL reais.
@@ -65,7 +66,7 @@ async function tokenOf(app: FastifyInstance, local: string, ip: string) {
 }
 
 async function cleanupDb() {
-  await prisma.auditEvent.deleteMany({
+  await purgeAuditEvents(prisma, {
     where: { OR: [{ user: { email: { endsWith: DOMAIN } } }, { ip: { startsWith: NET } }] },
   });
   await prisma.user.deleteMany({ where: { email: { endsWith: DOMAIN } } });
