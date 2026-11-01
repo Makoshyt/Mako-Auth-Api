@@ -22,6 +22,10 @@ import { authRoutes } from './modules/auth/auth.routes.js';
 import { createAuthService } from './modules/auth/auth.service.js';
 import { createAccessTokenSigner } from './modules/auth/tokens.js';
 import { healthRoutes } from './modules/health/health.routes.js';
+import { createMailer, type Mailer } from './modules/mail/mailer.js';
+import { createPasswordResetRepository } from './modules/password-reset/password-reset.repository.js';
+import { passwordResetRoutes } from './modules/password-reset/password-reset.routes.js';
+import { createPasswordResetService } from './modules/password-reset/password-reset.service.js';
 import { buildPolicies } from './modules/rate-limit/rate-limit.policies.js';
 import { createRedisRateLimitStore } from './modules/rate-limit/rate-limit.store.js';
 import { createRateLimiter, registerRateLimiting } from './modules/rate-limit/rate-limiter.js';
@@ -30,6 +34,7 @@ import { createUsersRepository } from './modules/users/users.repository.js';
 import { usersRoutes } from './modules/users/users.routes.js';
 import { createUsersService } from './modules/users/users.service.js';
 import { registerSwagger } from './plugins/swagger.js';
+import { createBackgroundTasks, type BackgroundTasks } from './shared/background-tasks.js';
 import { registerErrorHandling } from './shared/error-handler.js';
 import { hashPassword, verifyPassword } from './shared/password-hasher.js';
 
@@ -48,6 +53,15 @@ export interface AppDependencies {
   redis: Redis;
   /** Destino alternativo para os logs (usado nos testes que inspecionam o que é logado). */
   logDestination?: DestinationStream;
+  /** Provedor de email. Padrão: o escolhido por MAIL_PROVIDER. Os testes injetam o MemoryMailer. */
+  mailer?: Mailer;
+}
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    /** Tarefas disparadas após a resposta (ex.: email de recuperação). `idle()` espera todas. */
+    backgroundTasks: BackgroundTasks;
+  }
 }
 
 /**
@@ -60,6 +74,7 @@ export async function buildApp({
   prisma,
   redis,
   logDestination,
+  mailer: injectedMailer,
 }: AppDependencies): Promise<FastifyInstance> {
   const app = Fastify({
     logger: buildLoggerOptions(env, logDestination),
@@ -113,6 +128,30 @@ export async function buildApp({
 
   const adminService = createAdminService({ adminRepository: createAdminRepository(prisma) });
 
+  // Erros de tarefas em segundo plano vão só para o log (sem token nem email: só a mensagem).
+  const backgroundTasks = createBackgroundTasks((name, error) => {
+    app.log.error(
+      { task: name, reason: error instanceof Error ? error.message : 'erro desconhecido' },
+      'falha em tarefa em segundo plano',
+    );
+  });
+  app.decorate('backgroundTasks', backgroundTasks);
+  // No encerramento, espera emails pendentes antes de as conexões serem fechadas.
+  app.addHook('onClose', () => backgroundTasks.idle());
+
+  const mailer = injectedMailer ?? createMailer(env, app.log);
+  if (env.NODE_ENV === 'production' && mailer.name === 'log') {
+    app.log.warn('MAIL_PROVIDER=log em produção: emails de recuperação NÃO serão entregues');
+  }
+  const passwordResetService = createPasswordResetService({
+    repository: createPasswordResetRepository(prisma),
+    hashPassword,
+    mailer,
+    audit,
+    tasks: backgroundTasks,
+    tokenTtlMinutes: env.PASSWORD_RESET_TOKEN_TTL_MINUTES,
+  });
+
   // No contexto raiz: `app.authenticate` e `request.auth` ficam visíveis para todos os módulos.
   registerAuthentication(app, authService, audit);
   // Contadores no Redis compartilhado: o limite vale para todas as instâncias da API juntas.
@@ -136,6 +175,7 @@ export async function buildApp({
     await api.register(usersRoutes, { prefix: '/api/v1', usersService });
     await api.register(authRoutes, { prefix: '/api/v1', authService });
     await api.register(adminRoutes, { prefix: '/api/v1/admin', adminService });
+    await api.register(passwordResetRoutes, { prefix: '/api/v1', passwordResetService });
   });
 
   return app;

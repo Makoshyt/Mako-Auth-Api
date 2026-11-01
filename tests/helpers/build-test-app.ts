@@ -3,6 +3,7 @@ import type { DestinationStream } from 'pino';
 import { buildApp } from '../../src/app.js';
 import { createPrismaClient } from '../../src/infra/prisma.js';
 import { createRedisClient, type Redis } from '../../src/infra/redis.js';
+import type { Mailer } from '../../src/modules/mail/mailer.js';
 import { TEST_RATE_LIMIT_ROOT, testEnv, type TestEnvOptions } from './test-env.js';
 
 /**
@@ -28,6 +29,8 @@ export interface BuildTestAppOptions extends TestEnvOptions {
    */
   connectRedis?: boolean;
   logDestination?: DestinationStream;
+  /** Provedor de email injetado (ex.: MemoryMailer para ler o token de recuperação). */
+  mailer?: Mailer;
 }
 
 /**
@@ -37,7 +40,7 @@ export interface BuildTestAppOptions extends TestEnvOptions {
  */
 export async function buildTestApp(
   overrides: Record<string, string> = {},
-  { connectRedis = true, logDestination, rateLimits }: BuildTestAppOptions = {},
+  { connectRedis = true, logDestination, rateLimits, mailer }: BuildTestAppOptions = {},
 ): Promise<FastifyInstance> {
   const env = testEnv(overrides, { rateLimits });
   const prisma = createPrismaClient(env.DATABASE_URL);
@@ -47,7 +50,7 @@ export async function buildTestApp(
   });
   if (connectRedis) await redis.connect();
 
-  const app = await buildApp({ env, prisma, redis, logDestination });
+  const app = await buildApp({ env, prisma, redis, logDestination, ...(mailer && { mailer }) });
   app.addHook('onClose', async () => {
     if (redis.status === 'ready') await deleteTestKeys(redis, env.RATE_LIMIT_KEY_PREFIX);
     redis.disconnect();

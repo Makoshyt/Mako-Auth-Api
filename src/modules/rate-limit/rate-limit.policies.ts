@@ -92,6 +92,26 @@ export const POLICY_DEFINITIONS = {
     onStoreFailure: 'open',
     exposeHeaders: true,
   },
+  // Recuperação de senha (Etapa 7): todas fecham, pois liberar geral permitiria disparar
+  // emails em massa ou testar tokens sem limite enquanto o Redis estiver fora.
+  forgotPasswordIp: {
+    envKey: 'RATE_LIMIT_FORGOT_PASSWORD_IP',
+    scope: 'ip',
+    onStoreFailure: 'closed',
+    exposeHeaders: true,
+  },
+  forgotPasswordAccount: {
+    envKey: 'RATE_LIMIT_FORGOT_PASSWORD_ACCOUNT',
+    scope: 'account',
+    onStoreFailure: 'closed',
+    exposeHeaders: false,
+  },
+  resetPasswordIp: {
+    envKey: 'RATE_LIMIT_RESET_PASSWORD_IP',
+    scope: 'ip',
+    onStoreFailure: 'closed',
+    exposeHeaders: true,
+  },
 } as const satisfies Record<string, PolicyDefinition>;
 
 export type PolicyName = keyof typeof POLICY_DEFINITIONS;

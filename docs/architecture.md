@@ -1,6 +1,6 @@
 # Arquitetura e decisões técnicas
 
-> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 6 (rate limiting com Redis)**.
+> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 7 (recuperação de senha)**.
 
 ## Visão geral
 
@@ -758,3 +758,158 @@ com curl no servidor compilado confirmou o comportamento de `false`.
 - **Sem limite global por IP** nas rotas não listadas (ex.: `GET /users/me`) nem limitação de
   conexões. Isso fica a cargo do proxy reverso ou do WAF.
 - **Trocar `RATE_LIMIT_HMAC_SECRET` zera todos os contadores**, porque as chaves mudam.
+
+## Etapa 7: recuperação de senha
+
+### O que já existia e foi reaproveitado
+
+A Etapa 2 já tinha preparado a base, então **nenhuma migration foi necessária**:
+
+- a tabela `password_reset_tokens` (hash SHA-256 com CHECK de formato hex, `used_at`, índice
+  por usuário);
+- os tipos de auditoria `PASSWORD_RESET_REQUEST` e `PASSWORD_RESET_SUCCESS`, usados no lugar de
+  criar novos;
+- o motivo de revogação `PASSWORD_RESET`;
+- a pasta `.dev-mailbox/` no `.gitignore`.
+
+Também foram reaproveitados:
+
+- o gerador e o hash de token opaco da Etapa 4, generalizados como `generateOpaqueToken` e
+  `hashOpaqueToken`;
+- a política de senha e o `passwordSchema` da Etapa 3;
+- o Argon2id;
+- o `AuditRecorder`;
+- o rate limiter da Etapa 6, com 3 políticas novas.
+
+### Estrutura
+
+```
+src/modules/password-reset/
+  password-reset.repository.ts  # tokens + transação de conclusão (consumo, senha, tokens, sessões)
+  password-reset.service.ts     # pedido em segundo plano; reset com política de senha
+  password-reset.schemas.ts     # Zod: forgot { email }, reset { token, newPassword }
+  password-reset.routes.ts      # /auth/forgot-password, /auth/reset-password + rate limit
+src/modules/mail/
+  mailer.ts                     # interface Mailer, renderização, provedores log e dev-mailbox
+  memory-mailer.ts              # provedor de testes (só por injeção)
+src/shared/background-tasks.ts  # tarefas depois da resposta, com idle() no encerramento
+```
+
+### Fluxo
+
+```mermaid
+sequenceDiagram
+  participant C as Cliente
+  participant A as API
+  participant R as Redis
+  participant BG as Tarefa em 2º plano
+  participant DB as PostgreSQL
+  participant M as Mailer
+  C->>A: POST /auth/forgot-password {email}
+  A->>R: limite por IP (5/h) → Zod → limite por conta HMAC (3/h)
+  A-->>C: 202 "Se o email estiver cadastrado..." (sempre igual)
+  A->>BG: agenda (setImmediate)
+  BG->>DB: SELECT id WHERE email
+  alt conta existe
+    BG->>DB: INSERT token (só SHA-256, expira em 15 min)
+    BG->>DB: audit PASSWORD_RESET_REQUEST (TOKEN_ISSUED)
+    BG->>M: send(PASSWORD_RESET, to, token) → link ...#token=
+  else não existe
+    BG->>DB: audit PASSWORD_RESET_REQUEST (UNKNOWN_EMAIL)
+  end
+  C->>A: POST /auth/reset-password {token, newPassword}
+  A->>R: limite por IP (10/15 min)
+  A->>DB: SELECT token por SHA-256 (+ email e nome para a política)
+  A->>A: inválido/expirado/usado → 400 genérico · política → 400 WEAK_PASSWORD
+  A->>A: Argon2id (fora da transação)
+  A->>DB: TRANSAÇÃO: consome token (WHERE used_at IS NULL) · senha · demais tokens · revoga sessões
+  A->>DB: audit PASSWORD_RESET_SUCCESS {revokedSessions}
+  A-->>C: 200 "Senha redefinida..."
+```
+
+### Indistinguibilidade (enumeração de contas)
+
+| Canal          | Como foi neutralizado                                                                                                                                                                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Status e corpo | Sempre `202` com a mesma mensagem. Há teste que compara status, corpo e todos os cabeçalhos                                                                                                                                                             |
+| Tempo          | A rota só aplica os limites, valida e agenda a tarefa. Busca, INSERT e envio rodam **depois** da resposta. Há teste com o envio travado: a resposta sai mesmo assim. Medido no servidor compilado: 14,65 ms (conta existe) contra 14,42 ms (não existe) |
+| Rate limit     | O limite por conta vale para **qualquer** email enviado: o 4º pedido recebe `429` igual para conta existente e inexistente (testado)                                                                                                                    |
+| Validação      | `400` só por formato de email inválido, o que independe da conta                                                                                                                                                                                        |
+| Auditoria      | Registra o desfecho (`TOKEN_ISSUED`/`UNKNOWN_EMAIL`), mas só é visível ao ADMIN, nunca na resposta HTTP. O email entra só como hash                                                                                                                     |
+
+Erros da tarefa em segundo plano (como falha no envio) vão só para o log, com o nome da tarefa
+e a mensagem do erro, e nunca chegam ao cliente. No encerramento do servidor, `onClose` espera
+as tarefas pendentes antes de fechar as conexões.
+
+### Expiração e consumo único
+
+- **Validade de 15 minutos**, checada duas vezes: na leitura e de novo no `UPDATE` condicional
+  (`expires_at > now`), que fecha a janela entre as duas.
+- **Consumo atômico:**
+  `UPDATE password_reset_tokens SET used_at = now WHERE id = $1 AND used_at IS NULL AND expires_at > $2`.
+  Com requisições simultâneas, a segunda espera o commit da primeira, reavalia o `WHERE` e
+  atualiza zero linhas. Testes no PostgreSQL real:
+  - 2 resets simultâneos resultaram em um 200 e um 400, e só a senha do vencedor ficou gravada;
+  - 5 simultâneos resultaram em exatamente 1 sucesso;
+  - os dois testes rodaram 5 vezes seguidas, sem falha.
+- **Tudo ou nada:** consumo do token, novo hash, invalidação dos demais tokens e revogação das
+  sessões estão na **mesma transação**. Um teste injeta falha na última etapa (revogar sessões)
+  e verifica que a senha, o `used_at` e as sessões ficaram intactos e que o link continuou
+  utilizável.
+- **Testes de mutação** (os testes devem falhar se a proteção for removida):
+  - gravar a senha fora da transação foi detectado pelo teste de falha transacional;
+  - remover `used_at IS NULL` do consumo foi detectado pelos dois testes de concorrência.
+- **Senha fraca não queima o link:** a política é checada antes do consumo. O Argon2id roda fora
+  da transação, para não segurar locks durante a derivação.
+- **Pedidos repetidos** não invalidam links anteriores. Cada um vale até expirar, e o rate limit
+  admite no máximo 3 por hora. O primeiro reset bem-sucedido invalida todos os outros.
+
+### Revogação de sessões
+
+O reset revoga **todas** as sessões da conta (`revoked_reason = PASSWORD_RESET`). Como o
+`authenticate` consulta a sessão a cada requisição, os access tokens antigos param na hora, e os
+refresh tokens não renovam mais (testado com 3 sessões). Quem tinha roubado uma sessão perde o
+acesso. O usuário precisa entrar de novo, porque o reset não emite tokens.
+
+### Modelo de ameaças
+
+| Ameaça                                  | Mitigação                                                                                                                                    |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Enumeração de contas                    | Resposta idêntica e independente do tempo de busca. Limite por conta igual para emails inexistentes                                          |
+| Força bruta do token                    | 256 bits de entropia, 15 minutos de validade e 10 tentativas por IP a cada 15 minutos                                                        |
+| Vazamento do banco                      | Só o SHA-256 do token é armazenado. Um token de 256 bits não é reversível por dicionário                                                     |
+| Token em logs, Referer ou analytics     | Nunca na resposta nem no log (testado). No link, vai no **fragmento** `#token=`, que o navegador não envia a servidores nem põe no `Referer` |
+| Interceptação do link                   | `PASSWORD_RESET_URL` precisa usar **https** em produção (validado na inicialização). Validade curta e uso único                              |
+| Reuso, replay ou corrida                | Consumo atômico. Os demais tokens são invalidados no sucesso                                                                                 |
+| Reset de outra conta                    | O corpo só aceita `token` e `newPassword` (`strictObject`). A conta é sempre a dona do token (testado com `email`/`userId` extras)           |
+| Confusão de credenciais                 | Tokens de recuperação têm tabela própria. JWT e refresh token enviados como token de reset → 400 (testado)                                   |
+| Sessão roubada continuar ativa          | Todas as sessões são revogadas no reset                                                                                                      |
+| Bombardeio de emails para uma vítima    | 3 pedidos por conta e 5 por IP por hora                                                                                                      |
+| Redis fora do ar                        | As três políticas falham fechado (503): não há pedidos nem tentativas ilimitados                                                             |
+| Token salvo em disco no desenvolvimento | `dev-mailbox` é recusado em produção e a pasta está no `.gitignore`. O arquivo é gravado com modo `0600`                                     |
+| Escalonamento de privilégio             | O reset não toca no papel (testado com um ADMIN)                                                                                             |
+
+### Cuidados para o front-end (página de recuperação)
+
+- Ler o token de `location.hash` e removê-lo da barra de endereço logo em seguida
+  (`history.replaceState`), para que não fique no histórico nem seja copiado sem querer.
+- Servir a página com `Referrer-Policy: no-referrer` e sem scripts de terceiros (analytics,
+  chat), que podem ler a URL inteira, inclusive o fragmento.
+- Enviar o token **no corpo** do `POST /auth/reset-password`, nunca em query string.
+- Usar somente HTTPS, com HSTS.
+
+### Limitações conhecidas
+
+- **Nenhum provedor real de email.** Com `MAIL_PROVIDER=log`, a recuperação não entrega nada.
+  Para produção, implemente um `Mailer` (SMTP, SES, Resend...) e cuide de SPF, DKIM e DMARC.
+- **Tarefas em processo, sem fila persistente.** Se o processo cair entre a resposta e o envio,
+  o email se perde e o usuário precisa pedir de novo. Uma fila com retentativa (BullMQ sobre o
+  Redis existente) resolve. O encerramento gracioso já espera as tarefas pendentes.
+- **Sem confirmação por email da troca de senha.** Avisar o titular ("sua senha foi alterada")
+  depende do provedor real.
+- **A nova senha pode ser igual à antiga.** Rejeitar isso exige um Argon2id extra por tentativa.
+- **Falhas de reset (token inválido) não são auditadas** individualmente, para não amplificar
+  escrita. O rate limit registra o primeiro bloqueio (`RATE_LIMIT_EXCEEDED`).
+- **Alteração de senha autenticada** (sabendo a senha atual) não faz parte desta etapa.
+- Tokens consumidos ou expirados continuam na tabela. O expurgo segue a política de retenção da
+  Etapa 5.

@@ -33,6 +33,9 @@ export const RELAXED_RATE_LIMITS: Record<string, string> = Object.fromEntries(
     'ADMIN_USERS',
     'ADMIN_USER_BY_ID',
     'ADMIN_AUDIT_EVENTS',
+    'FORGOT_PASSWORD_IP',
+    'FORGOT_PASSWORD_ACCOUNT',
+    'RESET_PASSWORD_IP',
   ].map((name) => [`RATE_LIMIT_${name}`, '100000/1h']),
 );
 
@@ -59,6 +62,8 @@ export function testEnv(
     JWT_ACCESS_SECRET: TEST_JWT_SECRET,
     RATE_LIMIT_HMAC_SECRET: TEST_RATE_LIMIT_SECRET,
     RATE_LIMIT_KEY_PREFIX: `${TEST_RATE_LIMIT_ROOT}:${randomUUID()}`,
+    // https fictício: válido também nos testes que sobem o app com NODE_ENV=production.
+    PASSWORD_RESET_URL: 'https://app.example.com/reset-password',
     ...(rateLimits === 'relaxed' && RELAXED_RATE_LIMITS),
     ...overrides,
   });

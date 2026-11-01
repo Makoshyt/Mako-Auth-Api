@@ -47,6 +47,15 @@ describe('loadEnv', () => {
       RATE_LIMIT_ADMIN_USERS: { max: 60, windowMs: 60_000 },
       RATE_LIMIT_ADMIN_USER_BY_ID: { max: 60, windowMs: 60_000 },
       RATE_LIMIT_ADMIN_AUDIT_EVENTS: { max: 30, windowMs: 60_000 },
+      // Defaults da Etapa 7.
+      RATE_LIMIT_FORGOT_PASSWORD_IP: { max: 5, windowMs: 60 * 60_000 },
+      RATE_LIMIT_FORGOT_PASSWORD_ACCOUNT: { max: 3, windowMs: 60 * 60_000 },
+      RATE_LIMIT_RESET_PASSWORD_IP: { max: 10, windowMs: 15 * 60_000 },
+      PASSWORD_RESET_TOKEN_TTL_MINUTES: 15,
+      PASSWORD_RESET_URL: 'http://localhost:5173/reset-password',
+      MAIL_PROVIDER: 'log',
+      MAIL_FROM: 'AuthAPI Pro <no-reply@authapi.localhost>',
+      DEV_MAILBOX_DIR: '.dev-mailbox',
       ...required,
     });
   });
@@ -214,5 +223,45 @@ describe('loadEnv', () => {
         );
       },
     );
+  });
+
+  describe('recuperação de senha e email', () => {
+    it('em produção, recusa dev-mailbox (grava tokens em disco)', () => {
+      const error = captureError(() =>
+        loadEnv({
+          ...required,
+          NODE_ENV: 'production',
+          MAIL_PROVIDER: 'dev-mailbox',
+          PASSWORD_RESET_URL: 'https://app.example.com/reset',
+        }),
+      );
+      expect(error.issues).toEqual([expect.stringMatching(/^MAIL_PROVIDER: /)]);
+    });
+
+    it('em produção, exige https no link de recuperação', () => {
+      const error = captureError(() =>
+        loadEnv({
+          ...required,
+          NODE_ENV: 'production',
+          PASSWORD_RESET_URL: 'http://app.example.com/r',
+        }),
+      );
+      expect(error.issues).toEqual([expect.stringMatching(/^PASSWORD_RESET_URL: .*https/)]);
+    });
+
+    it('em desenvolvimento, aceita dev-mailbox e http local', () => {
+      const env = loadEnv({ ...required, MAIL_PROVIDER: 'dev-mailbox' });
+      expect(env.MAIL_PROVIDER).toBe('dev-mailbox');
+    });
+
+    it.each(['4', '61', 'abc'])('recusa PASSWORD_RESET_TOKEN_TTL_MINUTES=%s (5 a 60)', (value) => {
+      expect(() => loadEnv({ ...required, PASSWORD_RESET_TOKEN_TTL_MINUTES: value })).toThrow(
+        /PASSWORD_RESET_TOKEN_TTL_MINUTES/,
+      );
+    });
+
+    it.each(['smtp', 'ses', 'memory'])('recusa MAIL_PROVIDER desconhecido: %s', (value) => {
+      expect(() => loadEnv({ ...required, MAIL_PROVIDER: value })).toThrow(/MAIL_PROVIDER/);
+    });
   });
 });

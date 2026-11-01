@@ -125,6 +125,25 @@ export const envSchema = z
     RATE_LIMIT_ADMIN_USERS: rateLimitSpec('60/1m'),
     RATE_LIMIT_ADMIN_USER_BY_ID: rateLimitSpec('60/1m'),
     RATE_LIMIT_ADMIN_AUDIT_EVENTS: rateLimitSpec('30/1m'),
+    RATE_LIMIT_FORGOT_PASSWORD_IP: rateLimitSpec('5/1h'),
+    RATE_LIMIT_FORGOT_PASSWORD_ACCOUNT: rateLimitSpec('3/1h'),
+    RATE_LIMIT_RESET_PASSWORD_IP: rateLimitSpec('10/15m'),
+    // --- Recuperação de senha e email (Etapa 7) ---
+    PASSWORD_RESET_TOKEN_TTL_MINUTES: z.coerce.number().int().min(5).max(60).default(15),
+    /**
+     * Página do front-end que recebe o token. O token vai no FRAGMENTO (#token=...), que o
+     * navegador nunca envia a servidores nem coloca no Referer.
+     */
+    PASSWORD_RESET_URL: z
+      .url({ protocol: /^https?$/ })
+      .default('http://localhost:5173/reset-password'),
+    /**
+     * log: registra só metadados (nunca o token; o email não é entregue).
+     * dev-mailbox: grava a mensagem completa em DEV_MAILBOX_DIR para testar o fluxo localmente.
+     */
+    MAIL_PROVIDER: z.enum(['log', 'dev-mailbox']).default('log'),
+    MAIL_FROM: z.string().min(3).max(200).default('AuthAPI Pro <no-reply@authapi.localhost>'),
+    DEV_MAILBOX_DIR: z.string().min(1).default('.dev-mailbox'),
   })
   .superRefine((env, ctx) => {
     if (env.NODE_ENV === 'production' && env.CORS_ORIGINS.includes('*')) {
@@ -132,6 +151,20 @@ export const envSchema = z
         code: 'custom',
         path: ['CORS_ORIGINS'],
         message: 'wildcard "*" não é permitido em produção',
+      });
+    }
+    if (env.NODE_ENV === 'production' && env.MAIL_PROVIDER === 'dev-mailbox') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['MAIL_PROVIDER'],
+        message: 'dev-mailbox grava tokens em disco e não é permitido em produção',
+      });
+    }
+    if (env.NODE_ENV === 'production' && !env.PASSWORD_RESET_URL.startsWith('https://')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PASSWORD_RESET_URL'],
+        message: 'precisa usar https em produção (o link carrega o token)',
       });
     }
     if (env.RATE_LIMIT_HMAC_SECRET === env.JWT_ACCESS_SECRET) {

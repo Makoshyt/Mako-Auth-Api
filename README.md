@@ -3,7 +3,7 @@
 API REST de autenticação e gerenciamento de usuários construída com Node.js, TypeScript,
 Fastify, PostgreSQL e Prisma.
 
-> **Status:** Etapa 6 de 10 (rate limiting com Redis por IP, conta e usuário; RBAC, auditoria e JWT).
+> **Status:** Etapa 7 de 10 (recuperação de senha por link de uso único; rate limiting, RBAC, auditoria e JWT).
 > O README completo, com arquitetura, modelo de ameaças e roteiro de demonstração, chega na
 > Etapa 10. As decisões técnicas estão em [`docs/architecture.md`](docs/architecture.md).
 
@@ -47,21 +47,23 @@ localmente na 5432. As portas são publicadas apenas em `127.0.0.1`.
 
 ## Endpoints disponíveis
 
-| Método | Rota                         | Acesso   | Descrição                                                   |
-| ------ | ---------------------------- | -------- | ----------------------------------------------------------- |
-| GET    | `/health`                    | público  | Liveness do processo                                        |
-| GET    | `/ready`                     | público  | Readiness: PostgreSQL e Redis (200 ou 503)                  |
-| POST   | `/api/v1/auth/register`      | público  | Cadastro (papel USER), retorna 201                          |
-| POST   | `/api/v1/auth/login`         | público  | Cria uma sessão e devolve access token + refresh token      |
-| POST   | `/api/v1/auth/refresh`       | público* | Troca o refresh token por um par novo (rotação obrigatória) |
-| POST   | `/api/v1/auth/logout`        | Bearer   | Encerra a sessão atual (204)                                |
-| POST   | `/api/v1/auth/logout-all`    | Bearer   | Encerra todas as sessões do usuário (204)                   |
-| GET    | `/api/v1/users/me`           | Bearer   | Perfil do usuário autenticado                               |
-| PATCH  | `/api/v1/users/me`           | Bearer   | Altera nome e/ou email (o email exige `currentPassword`)    |
-| GET    | `/api/v1/admin/users`        | ADMIN    | Lista usuários: paginação, filtros e ordenação controlada   |
-| GET    | `/api/v1/admin/users/:id`    | ADMIN    | Consulta um usuário (404 se não existir)                    |
-| GET    | `/api/v1/admin/audit-events` | ADMIN    | Trilha de auditoria: filtros por tipo, usuário e período    |
-| GET    | `/docs`                      | público  | Swagger UI (desligável com `SWAGGER_ENABLED`)               |
+| Método | Rota                           | Acesso   | Descrição                                                       |
+| ------ | ------------------------------ | -------- | --------------------------------------------------------------- |
+| GET    | `/health`                      | público  | Liveness do processo                                            |
+| GET    | `/ready`                       | público  | Readiness: PostgreSQL e Redis (200 ou 503)                      |
+| POST   | `/api/v1/auth/register`        | público  | Cadastro (papel USER), retorna 201                              |
+| POST   | `/api/v1/auth/login`           | público  | Cria uma sessão e devolve access token + refresh token          |
+| POST   | `/api/v1/auth/refresh`         | público* | Troca o refresh token por um par novo (rotação obrigatória)     |
+| POST   | `/api/v1/auth/logout`          | Bearer   | Encerra a sessão atual (204)                                    |
+| POST   | `/api/v1/auth/logout-all`      | Bearer   | Encerra todas as sessões do usuário (204)                       |
+| GET    | `/api/v1/users/me`             | Bearer   | Perfil do usuário autenticado                                   |
+| PATCH  | `/api/v1/users/me`             | Bearer   | Altera nome e/ou email (o email exige `currentPassword`)        |
+| GET    | `/api/v1/admin/users`          | ADMIN    | Lista usuários: paginação, filtros e ordenação controlada       |
+| GET    | `/api/v1/admin/users/:id`      | ADMIN    | Consulta um usuário (404 se não existir)                        |
+| GET    | `/api/v1/admin/audit-events`   | ADMIN    | Trilha de auditoria: filtros por tipo, usuário e período        |
+| POST   | `/api/v1/auth/forgot-password` | público  | Pede o link de recuperação (sempre 202, exista ou não a conta)  |
+| POST   | `/api/v1/auth/reset-password`  | público  | Redefine a senha com o token do link e encerra todas as sessões |
+| GET    | `/docs`                        | público  | Swagger UI (desligável com `SWAGGER_ENABLED`)                   |
 
 \* Não exige o access token: a credencial é o próprio refresh token, enviado no corpo.
 
@@ -194,18 +196,21 @@ Os contadores ficam no **Redis compartilhado**, então o limite vale para todas 
 API juntas. Cada contador é atualizado por um script Lua atômico (`INCR` + `PEXPIRE`) e expira
 sozinho com a janela.
 
-| Endpoint                  | Limite padrão | Janela | Por                   | Redis fora do ar |
-| ------------------------- | ------------- | ------ | --------------------- | ---------------- |
-| `POST /auth/login`        | 5             | 15 min | IP                    | 503 (fechado)    |
-| `POST /auth/login`        | 10            | 1 h    | conta (HMAC do email) | 503 (fechado)    |
-| `POST /auth/register`     | 5             | 1 h    | IP                    | 503 (fechado)    |
-| `POST /auth/refresh`      | 20            | 15 min | IP                    | 503 (fechado)    |
-| `POST /auth/logout`       | 20            | 15 min | usuário               | libera (aberto)  |
-| `POST /auth/logout-all`   | 5             | 15 min | usuário               | libera (aberto)  |
-| `PATCH /users/me`         | 10            | 15 min | usuário               | 503 (fechado)    |
-| `GET /admin/users`        | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
-| `GET /admin/users/:id`    | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
-| `GET /admin/audit-events` | 30            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| Endpoint                     | Limite padrão | Janela | Por                   | Redis fora do ar |
+| ---------------------------- | ------------- | ------ | --------------------- | ---------------- |
+| `POST /auth/login`           | 5             | 15 min | IP                    | 503 (fechado)    |
+| `POST /auth/login`           | 10            | 1 h    | conta (HMAC do email) | 503 (fechado)    |
+| `POST /auth/register`        | 5             | 1 h    | IP                    | 503 (fechado)    |
+| `POST /auth/refresh`         | 20            | 15 min | IP                    | 503 (fechado)    |
+| `POST /auth/logout`          | 20            | 15 min | usuário               | libera (aberto)  |
+| `POST /auth/logout-all`      | 5             | 15 min | usuário               | libera (aberto)  |
+| `PATCH /users/me`            | 10            | 15 min | usuário               | 503 (fechado)    |
+| `GET /admin/users`           | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| `GET /admin/users/:id`       | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| `GET /admin/audit-events`    | 30            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
+| `POST /auth/forgot-password` | 5             | 1 h    | IP                    | 503 (fechado)    |
+| `POST /auth/forgot-password` | 3             | 1 h    | conta (HMAC do email) | 503 (fechado)    |
+| `POST /auth/reset-password`  | 10            | 15 min | IP                    | 503 (fechado)    |
 
 `/health`, `/ready`, `/docs` e `GET /users/me` não têm limite. Os valores são **defaults de
 desenvolvimento**: ajuste-os por variável de ambiente (`RATE_LIMIT_LOGIN_IP=5/15m` etc., ver
@@ -272,6 +277,69 @@ cabeçalhos aparecem em _Response headers_. Para repetir o teste antes de a jane
 `docker compose exec redis redis-cli --scan --pattern 'authapi:rl:*' | xargs -r docker compose exec -T redis redis-cli del`.
 Nunca use `FLUSHALL`.
 
+### Recuperação de senha
+
+1. `POST /api/v1/auth/forgot-password` com `{"email": "..."}` responde **sempre `202`** com a
+   mesma mensagem, exista ou não a conta. A busca da conta, a criação do token e o envio do
+   email acontecem **depois** da resposta, então nem o tempo de resposta denuncia a conta
+   (medido no servidor compilado: 14,65 ms com conta e 14,42 ms sem).
+2. Se a conta existir, chega um email com o link
+   `PASSWORD_RESET_URL#token=<token>`. O token vai no **fragmento** (`#`), que o navegador
+   nunca envia a servidores nem coloca no cabeçalho `Referer`.
+3. `POST /api/v1/auth/reset-password` com `{"token": "...", "newPassword": "..."}` troca a senha
+   e **encerra todas as sessões** da conta, inclusive a de quem estiver usando a senha antiga.
+   A rota não faz login: entre de novo com a nova senha.
+
+| Regra           | Valor                                                                                                     |
+| --------------- | --------------------------------------------------------------------------------------------------------- |
+| Token           | 256 bits aleatórios (base64url). No banco fica só o **SHA-256**. Nunca aparece em resposta ou log         |
+| Validade        | 15 minutos (`PASSWORD_RESET_TOKEN_TTL_MINUTES`)                                                           |
+| Uso único       | Consumido de forma atômica. Com requisições simultâneas, só uma vence (testado com 5 em paralelo)         |
+| Nova senha      | Mesma política do cadastro. Uma senha fraca **não** queima o link                                         |
+| Depois do reset | Os outros links da conta deixam de valer e todas as sessões são revogadas (`PASSWORD_RESET`)              |
+| Erro de token   | Sempre `400 INVALID_RESET_TOKEN` "Link de recuperação inválido ou expirado" (inválido, expirado ou usado) |
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "$api/auth/forgot-password" -ContentType 'application/json' `
+  -Body '{"email":"bruno.user@example.com"}'
+Invoke-RestMethod -Method Post -Uri "$api/auth/reset-password" -ContentType 'application/json' `
+  -Body '{"token":"<token do link>","newPassword":"girassol teimoso na janela azul"}'
+```
+
+```jsonc
+// POST /auth/forgot-password → 202 (idêntico para conta existente e inexistente)
+{ "message": "Se o email estiver cadastrado, você receberá as instruções para redefinir a senha." }
+
+// POST /auth/reset-password → 200
+{ "message": "Senha redefinida. Entre novamente com a nova senha." }
+
+// POST /auth/reset-password com token inválido, expirado ou já usado → 400
+{ "error": { "code": "INVALID_RESET_TOKEN", "message": "Link de recuperação inválido ou expirado", "requestId": "31a41ee6-..." } }
+
+// POST /auth/reset-password com senha comum → 400 (o link continua valendo)
+{ "error": { "code": "WEAK_PASSWORD", "message": "Esta senha é muito comum. Prefira uma frase com várias palavras",
+             "requestId": "e9063c93-...", "details": { "reason": "COMMON_PASSWORD" } } }
+```
+
+**Testar localmente, sem serviço de email pago.** No `.env`, defina
+`MAIL_PROVIDER=dev-mailbox` e reinicie o `npm run dev`. Cada email vira um arquivo `.txt` em
+`.dev-mailbox/`, pasta que está no `.gitignore`:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "$api/auth/forgot-password" -ContentType 'application/json' `
+  -Body '{"email":"bruno.user@example.com"}'
+Get-ChildItem .dev-mailbox | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content
+# ... http://localhost:5173/reset-password#token=<TOKEN> → copie o valor depois de "#token="
+```
+
+- **Padrão (`MAIL_PROVIDER=log`):** registra só o tipo e a validade do email, nunca o token nem o
+  destinatário, e **não entrega nada**. É o único provedor permitido em produção até existir uma
+  integração real. A API avisa no log ao subir com ele em produção.
+- **`dev-mailbox`:** é **recusado** com `NODE_ENV=production`, porque grava tokens em disco.
+- **Provedor real:** basta implementar a interface `Mailer` (`src/modules/mail/mailer.ts`) e
+  registrá-lo em `createMailer`. Os testes automatizados usam o `MemoryMailer`, injetado
+  diretamente no app.
+
 ### Política de senhas
 
 12 a 128 caracteres, qualquer caractere (passphrases são bem-vindas), **sem** regras de
@@ -291,6 +359,8 @@ ou o email. Detalhes em [`docs/architecture.md`](docs/architecture.md#política-
 7. **POST `/api/v1/auth/refresh`** com `{"refreshToken": "..."}` devolve um par novo. Executar
    de novo com o token **antigo** devolve `409`. Atualize o Authorize com o access token novo.
 8. **POST `/api/v1/auth/logout`** devolve `204`. Repetir o `GET /users/me` agora dá `401`.
+9. Com `MAIL_PROVIDER=dev-mailbox`, **POST `/api/v1/auth/forgot-password`** gera o email em
+   `.dev-mailbox/`. Use o token do link em **POST `/api/v1/auth/reset-password`**.
 
 ### Exemplos (PowerShell)
 
@@ -357,6 +427,7 @@ Invoke-RestMethod -Method Post -Uri "$api/auth/logout" -Headers @{ Authorization
 | `REFRESH_TOKEN_ALREADY_ROTATED` | 409    | Token trocado há menos de 10 s: use o par mais recente      |
 | `FORBIDDEN`                     | 403    | Papel sem permissão para o recurso                          |
 | `INVALID_CURRENT_PASSWORD`      | 403    | Senha atual errada na troca de email                        |
+| `INVALID_RESET_TOKEN`           | 400    | Link de recuperação inválido, expirado ou já usado          |
 | `RATE_LIMITED`                  | 429    | Limite de requisições excedido: veja `Retry-After`          |
 | `SERVICE_UNAVAILABLE`           | 503    | Proteção contra abuso indisponível (Redis fora do ar)       |
 

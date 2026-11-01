@@ -7,7 +7,7 @@ import type { Role } from '../../generated/prisma/enums.js';
 const ALGORITHM = 'HS256';
 const ISSUER = 'authapi-pro';
 const AUDIENCE = 'authapi-pro:api';
-const REFRESH_TOKEN_BYTES = 32;
+const OPAQUE_TOKEN_BYTES = 32;
 
 export interface AccessTokenClaims {
   /** id do usuário */
@@ -85,15 +85,22 @@ export function createAccessTokenSigner(secret: string, ttlSeconds: number): Acc
   };
 }
 
-/** Refresh token opaco: 256 bits aleatórios. Não carrega dados, só serve de chave. */
-export function generateRefreshToken(): string {
-  return randomBytes(REFRESH_TOKEN_BYTES).toString('base64url');
+/**
+ * Token opaco: 256 bits aleatórios em base64url (43 caracteres). Não carrega dados, só serve
+ * de chave. Usado para refresh tokens e tokens de recuperação de senha (nunca um no lugar do
+ * outro: cada um vive na própria tabela).
+ */
+export function generateOpaqueToken(): string {
+  return randomBytes(OPAQUE_TOKEN_BYTES).toString('base64url');
 }
 
 /**
  * Só o SHA-256 vai para o banco. Um vazamento da tabela não entrega tokens utilizáveis,
  * e como o token tem 256 bits de entropia, um hash rápido (sem salt) é suficiente.
  */
-export function hashRefreshToken(token: string): string {
+export function hashOpaqueToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
+
+export const generateRefreshToken = generateOpaqueToken;
+export const hashRefreshToken = hashOpaqueToken;
