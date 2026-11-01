@@ -1,0 +1,34 @@
+# Dependências
+node_modules/
+
+# Build e cobertura
+dist/
+# Client do Prisma: gerado a partir do schema (npm install / npm run db:generate)
+src/generated/
+coverage/
+*.tsbuildinfo
+
+# Variáveis de ambiente (segredos nunca são versionados)
+.env
+.env.*
+!.env.example
+
+# Caixa de saída do provedor de email de desenvolvimento (contém tokens)
+.dev-mailbox/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Sistema operacional e editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Claude Code (configurações locais)
+.claude/settings.local.json

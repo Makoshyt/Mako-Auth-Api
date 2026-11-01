@@ -1,0 +1,45 @@
+# Infraestrutura de DESENVOLVIMENTO local. Não use estas credenciais em produção.
+# As portas são publicadas apenas em 127.0.0.1: nada fica acessível pela rede.
+name: authapi-pro
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-authapi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-authapi_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-authapi}
+    ports:
+      # 5433 no host: a 5432 já é usada pelo PostgreSQL nativo do Windows.
+      - '127.0.0.1:5433:5432'
+    volumes:
+      # Imagens do PostgreSQL 18+ guardam os dados em /var/lib/postgresql/<versão>/docker.
+      - postgres-data:/var/lib/postgresql
+      # Executado apenas na primeira criação do volume: cria o banco de testes.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:8.10.3-alpine
+    restart: unless-stopped
+    # AOF ligado para que contadores de rate limit sobrevivam a um restart do container.
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:

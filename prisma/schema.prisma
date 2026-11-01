@@ -1,0 +1,178 @@
+// Tabelas e colunas em snake_case no banco (@@map/@map); camelCase no TypeScript.
+// Restrições CHECK, que o Prisma não expressa, foram adicionadas ao SQL da migration init.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+  // Permite declarar no schema o índice único parcial de security_alerts.
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum SessionRevokeReason {
+  LOGOUT
+  LOGOUT_ALL
+  TOKEN_REUSE
+  PASSWORD_RESET
+  EMAIL_CHANGE // demais sessões revogadas após a troca de email
+}
+
+enum AuditEventType {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  LOGOUT_ALL // todas as sessões encerradas de uma vez (Etapa 5; antes era LOGOUT com scope ALL)
+  PASSWORD_RESET_REQUEST
+  PASSWORD_RESET_SUCCESS
+  TOKEN_REUSE_DETECTED
+  ACCESS_DENIED
+}
+
+enum AlertRule {
+  BRUTE_FORCE_ACCOUNT // muitas falhas de login para o mesmo email
+  CREDENTIAL_STUFFING // um IP falhando em muitos emails diferentes
+  TOKEN_REUSE // refresh token reutilizado fora da janela de tolerância
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum AlertStatus {
+  OPEN
+  RESOLVED
+}
+
+model User {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  /// Sempre normalizado (trim + minúsculas) pela aplicação; o banco reforça com CHECK.
+  email             String   @unique @db.VarChar(254)
+  name              String   @db.VarChar(100)
+  /// String PHC do Argon2id. Nunca é exposta pela API.
+  passwordHash      String   @map("password_hash")
+  role              Role     @default(USER)
+  passwordChangedAt DateTime @default(now()) @map("password_changed_at") @db.Timestamptz(3)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions            Session[]
+  passwordResetTokens PasswordResetToken[]
+  auditEvents         AuditEvent[]
+  securityAlerts      SecurityAlert[]
+
+  @@map("users")
+}
+
+/// Uma sessão por login. É também a "família" dos refresh tokens:
+/// revogar a sessão invalida todos os tokens dela de uma vez.
+model Session {
+  id            String               @id @default(uuid(7)) @db.Uuid
+  userId        String               @map("user_id") @db.Uuid
+  /// Validade absoluta: a rotação não estende a sessão além deste ponto.
+  expiresAt     DateTime             @map("expires_at") @db.Timestamptz(3)
+  revokedAt     DateTime?            @map("revoked_at") @db.Timestamptz(3)
+  revokedReason SessionRevokeReason? @map("revoked_reason")
+  ip            String?              @db.VarChar(45)
+  userAgent     String?              @map("user_agent") @db.VarChar(255)
+  lastUsedAt    DateTime?            @map("last_used_at") @db.Timestamptz(3)
+  createdAt     DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  // Sessões ativas de um usuário (logout-all e verificação no middleware).
+  @@index([userId, revokedAt])
+  @@map("sessions")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  sessionId String    @map("session_id") @db.Uuid
+  /// SHA-256 (hex) do token opaco. O valor original nunca é armazenado.
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  /// Preenchido quando o token é trocado por outro (rotação). Usado uma vez = consumido.
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  /// SHA-256 (hex) do token enviado por email. O valor original nunca é armazenado.
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// Trilha de auditoria. Sem senhas, tokens ou segredos. Sobrevive à exclusão do usuário (SetNull).
+model AuditEvent {
+  id        String         @id @default(uuid(7)) @db.Uuid
+  type      AuditEventType
+  userId    String?        @map("user_id") @db.Uuid
+  /// SHA-256 do email normalizado: correlaciona tentativas sem guardar o email
+  /// (inclusive de contas inexistentes).
+  emailHash String?        @map("email_hash") @db.Char(64)
+  ip        String?        @db.VarChar(45)
+  /// Contexto mínimo e estruturado (ex.: { "reason": "INVALID_PASSWORD" }).
+  metadata  Json?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt]) // retenção (purge) e filtro por período
+  @@index([type, createdAt]) // consulta administrativa por tipo + período
+  @@index([userId, createdAt])
+  @@index([emailHash, createdAt]) // regra BRUTE_FORCE_ACCOUNT
+  @@index([ip, createdAt]) // regra CREDENTIAL_STUFFING
+  @@map("audit_events")
+}
+
+model SecurityAlert {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  rule        AlertRule
+  severity    AlertSeverity
+  status      AlertStatus   @default(OPEN)
+  /// Identifica "o mesmo incidente" (regra + alvo). Único entre alertas OPEN (índice parcial).
+  fingerprint String        @db.VarChar(128)
+  /// Explicação determinística gerada pelo motor de regras.
+  summary     String        @db.VarChar(500)
+  /// Evidências minimizadas: contagens, janela de tempo, limites aplicados.
+  details     Json
+  userId      String?       @map("user_id") @db.Uuid
+  eventCount  Int           @default(1) @map("event_count")
+  firstSeenAt DateTime      @map("first_seen_at") @db.Timestamptz(3)
+  lastSeenAt  DateTime      @map("last_seen_at") @db.Timestamptz(3)
+  resolvedAt  DateTime?     @map("resolved_at") @db.Timestamptz(3)
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  // No máximo um alerta OPEN por incidente: deduplicação segura contra concorrência.
+  @@unique([fingerprint], map: "security_alerts_open_fingerprint_key", where: raw("status = 'OPEN'"))
+  @@map("security_alerts")
+}
