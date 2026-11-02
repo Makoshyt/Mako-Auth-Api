@@ -19,9 +19,27 @@ async function main(): Promise<void> {
     app.log.warn({ err: error }, 'redis indisponível');
   });
 
+  // Encerramento gracioso: para de aceitar conexões (novas requisições recebem 503), espera as
+  // em andamento, os emails pendentes e a rodada atual do motor de alertas. Se algo travar,
+  // o prazo garante a saída (com código 1, para o orquestrador registrar a falha).
+  const SHUTDOWN_TIMEOUT_MS = 15_000;
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     app.log.info({ signal }, 'encerrando servidor');
-    await app.close();
+    setTimeout(() => {
+      app.log.error(
+        { timeoutMs: SHUTDOWN_TIMEOUT_MS },
+        'encerramento excedeu o prazo; forçando saída',
+      );
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS).unref();
+    try {
+      await app.close();
+    } catch (error) {
+      app.log.error({ err: error }, 'falha ao encerrar o servidor');
+    }
     await Promise.allSettled([prisma.$disconnect(), redis.quit()]);
     process.exit(0);
   };

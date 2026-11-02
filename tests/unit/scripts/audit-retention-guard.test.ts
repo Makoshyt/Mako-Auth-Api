@@ -64,6 +64,17 @@ describe('checkRetentionRun (npm run audit:retention)', () => {
     ]);
   });
 
+  it('alerts:retention: a mensagem cita a variável que liga a exclusão de alertas', () => {
+    expect(
+      errorsOf({
+        databaseUrl: TEST_DB,
+        execute: true,
+        confirm: 'authapi_test',
+        enabledVariable: 'ALERTS_RETENTION_ENABLED',
+      }),
+    ).toEqual(['Exclusão desligada: defina ALERTS_RETENTION_ENABLED=true para executar.']);
+  });
+
   it('DATABASE_URL inválida: recusa', () => {
     expect(errorsOf({ databaseUrl: 'mysql://x/y' })).toEqual(['DATABASE_URL ausente ou inválida.']);
     expect(errorsOf({ databaseUrl: undefined })).toHaveLength(1);

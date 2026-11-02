@@ -24,15 +24,31 @@ const alertSelect = {
   firstSeenAt: true,
   lastSeenAt: true,
   resolvedAt: true,
+  resolvedById: true,
+  resolutionNote: true,
   createdAt: true,
   updatedAt: true,
 } as const satisfies Prisma.SecurityAlertSelect;
 
 export type AlertView = Prisma.SecurityAlertGetPayload<{ select: typeof alertSelect }>;
 
+export interface ResolveAlertInput {
+  id: string;
+  resolvedById: string;
+  note: string | null;
+  at: Date;
+}
+
 export interface AlertsRepository {
   list(query: ListAlertsQuery): Promise<{ items: AlertView[]; total: number }>;
   findById(id: string): Promise<AlertView | null>;
+  /**
+   * OPEN -> RESOLVED, condicional (WHERE status = 'OPEN'): duas resoluções simultâneas não
+   * se sobrescrevem; a segunda recebe null. Nunca altera regra, contagens nem evidências.
+   */
+  resolve(input: ResolveAlertInput): Promise<AlertView | null>;
+  /** Dos ids informados, os que ainda existem em audit_events (a retenção pode ter apagado). */
+  existingEventIds(ids: readonly string[]): Promise<string[]>;
 }
 
 export function createAlertsRepository(prisma: PrismaClient): AlertsRepository {
@@ -59,6 +75,24 @@ export function createAlertsRepository(prisma: PrismaClient): AlertsRepository {
 
     findById(id) {
       return prisma.securityAlert.findUnique({ where: { id }, select: alertSelect });
+    },
+
+    async resolve({ id, resolvedById, note, at }) {
+      const { count } = await prisma.securityAlert.updateMany({
+        where: { id, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: at, resolvedById, resolutionNote: note },
+      });
+      if (count === 0) return null;
+      return prisma.securityAlert.findUnique({ where: { id }, select: alertSelect });
+    },
+
+    async existingEventIds(ids) {
+      if (ids.length === 0) return [];
+      const rows = await prisma.auditEvent.findMany({
+        where: { id: { in: [...ids] } },
+        select: { id: true },
+      });
+      return rows.map((row) => row.id);
     },
   };
 }

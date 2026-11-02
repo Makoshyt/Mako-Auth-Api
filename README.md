@@ -1,583 +1,429 @@
 # AuthAPI Pro
 
-API REST de autenticação e gerenciamento de usuários construída com Node.js, TypeScript,
-Fastify, PostgreSQL e Prisma.
+API REST de autenticação e gestão de usuários com foco em segurança: JWT com rotação de refresh
+tokens, RBAC, rate limiting distribuído no Redis, recuperação de senha resistente a enumeração,
+trilha de auditoria append-only e um motor de detecção de ameaças com explicação opcional por IA
+local.
 
-> **Status:** Etapa 9 de 10 (motor de alertas de segurança com IA local opcional; auditoria, recuperação de senha, rate limiting, RBAC e JWT).
-> O README completo, com arquitetura, modelo de ameaças e roteiro de demonstração, chega na
-> Etapa 10. As decisões técnicas estão em [`docs/architecture.md`](docs/architecture.md).
+Construída com **Node.js 24, TypeScript (strict), Fastify 5, PostgreSQL, Prisma 7 e Redis**.
 
-## Requisitos
+> Projeto de portfólio. Os números citados aqui (testes, tempos) foram medidos neste repositório;
+> o workflow de CI está em [`.github/workflows/ci.yml`](.github/workflows/ci.yml), mas ainda não
+> foi executado no GitHub.
 
-- Node.js 24 LTS
-- Docker Desktop (aberto e rodando)
+---
 
-## Executar localmente (Windows PowerShell)
+## Sumário
 
-```powershell
-npm install                      # instala dependências e gera o Prisma Client
-Copy-Item .env.example .env      # só na primeira vez; depois preencha JWT_ACCESS_SECRET (abaixo)
-npm run docker:up                # PostgreSQL (127.0.0.1:5433) e Redis (127.0.0.1:6379)
-npm run db:migrate               # aplica as migrations no banco de desenvolvimento
-npm run db:seed                  # usuários fictícios (opcional)
-npm run dev
+1. [O problema](#o-problema)
+2. [Funcionalidades](#funcionalidades)
+3. [Stack](#stack)
+4. [Arquitetura](#arquitetura)
+5. [Fluxo de autenticação](#fluxo-de-autenticação)
+6. [Segurança](#segurança)
+7. [Motor de alertas](#motor-de-alertas)
+8. [IA local opcional (Ollama)](#ia-local-opcional-ollama)
+9. [Como executar](#como-executar)
+10. [Testes](#testes)
+11. [Endpoints](#endpoints)
+12. [Variáveis de ambiente](#variáveis-de-ambiente)
+13. [Estrutura de pastas](#estrutura-de-pastas)
+14. [CI/CD](#cicd)
+15. [Limitações conhecidas](#limitações-conhecidas)
+16. [Próximas evoluções](#próximas-evoluções)
+
+Documentação técnica detalhada: [`docs/architecture.md`](docs/architecture.md) ·
+Prontidão para produção: [`docs/production-readiness.md`](docs/production-readiness.md)
+
+---
+
+## O problema
+
+Autenticação parece simples até chegar aos detalhes que costumam virar incidente: tokens que não
+podem ser revogados, refresh tokens roubados reutilizados sem ninguém perceber, mensagens de erro
+que revelam quais emails existem, rate limit que só funciona numa instância, logs com senhas e
+tokens, e nenhuma visibilidade sobre ataques em andamento.
+
+O AuthAPI Pro trata esses pontos de forma explícita e testada, e documenta cada decisão e cada
+limitação que permanece.
+
+## Funcionalidades
+
+- **Contas:** cadastro, perfil, troca de email com reautenticação (revoga as demais sessões).
+- **Autenticação:** access token JWT (HS256, 15 min) + refresh token opaco com **rotação
+  obrigatória** e **detecção de reuso** (reuso fora da janela de tolerância revoga a sessão).
+- **Sessões:** validade absoluta, logout, logout de todas as sessões, revogação imediata
+  (cada requisição confirma a sessão no banco).
+- **Recuperação de senha:** resposta idêntica (status, corpo e tempo) exista ou não a conta;
+  token de uso único com 256 bits, só o hash no banco; o reset encerra todas as sessões.
+- **RBAC:** papéis `USER` e `ADMIN`, avaliados com o papel **atual** do banco.
+- **Rate limiting** no Redis, compartilhado entre instâncias, por IP, conta e usuário, com
+  chaves pseudonimizadas por HMAC e comportamento definido para Redis fora do ar.
+- **Auditoria append-only** (trigger no PostgreSQL), sem senhas, tokens ou emails em claro, com
+  retenção configurável e manual.
+- **Motor de alertas:** 6 regras determinísticas sobre a trilha de auditoria, deduplicação,
+  tolerância a eventos atrasados, ciclo de vida (OPEN → RESOLVED) e retenção.
+- **IA local opcional:** explicação dos alertas por um modelo Ollama local (desligada por padrão,
+  nunca decide nada).
+- **Operação:** `/health` e `/ready`, logs estruturados com redação, Swagger/OpenAPI gerado dos
+  schemas Zod, encerramento gracioso.
+
+## Stack
+
+| Camada        | Tecnologia                                                                    |
+| ------------- | ----------------------------------------------------------------------------- |
+| Runtime       | Node.js 24 (ESM), TypeScript 6 em modo strict                                 |
+| HTTP          | Fastify 5, `@fastify/helmet`, `@fastify/cors`                                 |
+| Validação     | Zod 4 (entrada, saída, variáveis de ambiente) via `fastify-type-provider-zod` |
+| Banco         | PostgreSQL 18 com Prisma 7 (driver adapter `pg`)                              |
+| Cache/limites | Redis 8 (`ioredis`)                                                           |
+| Criptografia  | `jose` (JWT), Argon2id nativo do `node:crypto`, SHA-256 e HMAC-SHA256         |
+| Documentação  | `@fastify/swagger` + Swagger UI (OpenAPI 3.1)                                 |
+| Testes        | Vitest 5 (unitários + integração contra PostgreSQL e Redis reais)             |
+| Infra local   | Docker Compose                                                                |
+| IA (opcional) | Ollama local com `qwen2.5:7b`                                                 |
+| Qualidade     | ESLint (type-checked), Prettier, GitHub Actions                               |
+
+## Arquitetura
+
+Monólito modular em camadas, com injeção de dependências manual num único _composition root_
+(`src/app.ts`). Cada módulo tem rotas (HTTP + schemas Zod), service (regras de negócio, sem
+Fastify) e repository (Prisma).
+
+```mermaid
+flowchart LR
+  C[Cliente] --> F[Fastify<br/>helmet · CORS · Zod]
+  F --> RL{{Rate limit<br/>Redis}}
+  F --> AU{{authenticate<br/>JWT + sessão no banco}}
+  AU --> RB{{requireRole}}
+  F --> M[Módulos<br/>auth · users · admin · password-reset · alerts]
+  M --> PG[(PostgreSQL)]
+  M --> AD[Auditoria<br/>append-only]
+  AD --> PG
+  E[Motor de alertas<br/>rodadas periódicas] --> PG
+  M -. explicação opcional .-> O[Ollama local]
 ```
 
-- Liveness: <http://127.0.0.1:3000/health>
-- Readiness (PostgreSQL e Redis): <http://127.0.0.1:3000/ready>
-- Swagger UI: <http://127.0.0.1:3000/docs>
-- OpenAPI JSON: <http://127.0.0.1:3000/docs/json>
+- **PostgreSQL** guarda tudo que precisa ser durável e consistente: usuários, sessões, hashes de
+  tokens, auditoria, alertas e o checkpoint do motor. Operações críticas são transacionais
+  (rotação de refresh token, reset de senha, troca de email, rodadas do motor).
+- **Redis** guarda apenas contadores de rate limit (efêmeros, com TTL).
+- **Processo em segundo plano:** o motor de alertas roda dentro da API em rodadas periódicas,
+  fora do caminho das requisições, ou pelo comando `npm run alerts:process`.
 
-`JWT_ACCESS_SECRET` e `RATE_LIMIT_HMAC_SECRET` são obrigatórios (mínimo de 32 caracteres cada,
-e diferentes entre si). Sem eles, a API não sobe. Gere um valor para cada um, rodando o comando
-duas vezes, e cole no `.env`, que nunca é versionado:
+Detalhes, diagramas e trade-offs: [`docs/architecture.md`](docs/architecture.md).
+
+## Fluxo de autenticação
+
+```mermaid
+sequenceDiagram
+  participant C as Cliente
+  participant A as API
+  participant DB as PostgreSQL
+  C->>A: POST /auth/login (email, senha)
+  A->>DB: cria sessão + hash do refresh token
+  A-->>C: accessToken (JWT 15 min) + refreshToken (opaco)
+  C->>A: GET /users/me (Bearer accessToken)
+  A->>DB: sessão ativa? papel atual?
+  A-->>C: 200
+  C->>A: POST /auth/refresh (refreshToken)
+  A->>DB: consome o token (UPDATE condicional) e emite o próximo
+  A-->>C: novo par
+  Note over A,DB: Reapresentar um token já usado fora da janela de 10 s<br/>revoga a sessão inteira e grava TOKEN_REUSE_DETECTED
+```
+
+- O access token carrega `sub`, `sid` e `role`, com `iss`/`aud` fixos e algoritmo único (HS256).
+- A autorização usa o papel do banco, não o do token: um rebaixamento vale na hora.
+- Refresh tokens e tokens de recuperação são opacos (256 bits); o banco guarda só o SHA-256.
+
+## Segurança
+
+| Ameaça                                | Mitigação                                                                                                        |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Força bruta e credential stuffing     | Rate limit por IP **e** por conta (email normalizado), Argon2id (OWASP: 19 MiB, t=2), alertas                    |
+| Enumeração de contas                  | Login com mensagem única e custo igual (hash fictício); recuperação sempre `202`, com o trabalho após a resposta |
+| Roubo de refresh token                | Rotação obrigatória, consumo atômico, reuso revoga a família inteira                                             |
+| Token roubado após logout/reset       | Toda requisição confirma a sessão no banco; reset e troca de email revogam sessões                               |
+| `alg: none` / troca de algoritmo      | Lista fixa (`HS256`), `iss` e `aud` obrigatórios, claims validadas com Zod                                       |
+| Escalada de privilégio / IDOR         | Fora de `/admin` nenhuma rota recebe id de usuário; cadastro sempre `USER`; `requireRole` com papel do banco     |
+| Vazamento em logs                     | Redação de headers e campos sensíveis, URL sem query string, testes que procuram segredos nos logs               |
+| Falsificação de IP (X-Forwarded-For)  | `TRUST_PROXY=true` é recusado; só número de saltos ou lista de proxies                                           |
+| Redis fora do ar                      | Rotas sensíveis falham fechadas (`503`); leituras de baixo risco falham abertas                                  |
+| Adulteração da auditoria              | Trigger recusa `UPDATE`/`DELETE`; exclusão só pela rotina de retenção                                            |
+| Abuso de payload / conexões lentas    | `bodyLimit` de 16 KB, `requestTimeout`, schemas `strictObject`                                                   |
+| Exposição de documentação em produção | Swagger desligado por padrão com `NODE_ENV=production`                                                           |
+
+Configuração validada na inicialização: segredos com pelo menos 32 caracteres e diferentes entre
+si, CORS sem `*` em produção, link de recuperação obrigatoriamente `https` em produção. Mensagens
+de erro citam a variável e a correção, nunca o valor.
+
+## Motor de alertas
+
+Lê a trilha de auditoria e gera alertas persistidos em `security_alerts`. Não bloqueia contas
+nem age sobre usuários.
+
+| Regra                  | Dispara quando (padrão configurável)                    | Severidade             |
+| ---------------------- | ------------------------------------------------------- | ---------------------- |
+| `BRUTE_FORCE_ACCOUNT`  | ≥ 8 falhas de login para a mesma conta em 1 h           | MEDIUM (HIGH com ≥ 16) |
+| `CREDENTIAL_STUFFING`  | Um IP falhando em ≥ 5 contas diferentes em 1 h          | HIGH                   |
+| `TOKEN_REUSE`          | Refresh token reutilizado fora da janela de tolerância  | HIGH                   |
+| `RATE_LIMIT_ABUSE`     | O mesmo IP bloqueado pelo rate limit ≥ 3 vezes em 1 h   | LOW (MEDIUM com ≥ 6)   |
+| `ADMIN_ACCESS_PROBING` | Um usuário com ≥ 5 acessos negados a rotas admin em 1 h | MEDIUM (HIGH com ≥ 10) |
+| `PASSWORD_RESET_ABUSE` | ≥ 5 pedidos de recuperação do mesmo IP em 1 h           | LOW (MEDIUM com ≥ 10)  |
+
+Garantias principais (todas cobertas por testes de integração):
+
+- **Sem perda de eventos:** checkpoint persistido de `created_at` **e** horizonte de transações
+  do PostgreSQL (`xid8`), que encontra eventos que confirmaram atrasados.
+- **Sem contagem dupla:** cada evento soma uma única vez (livro-razão `detection_flagged_events`),
+  inclusive ao reprocessar um intervalo.
+- **Um processador por vez:** advisory lock; rodar a API e o comando manual juntos é seguro.
+- **Deduplicação deslizante:** um incidente contínuo é um alerta, até uma duração máxima (7 dias);
+  depois abre-se um alerta novo ligado ao anterior.
+- **Ciclo de vida:** `PATCH /admin/security-alerts/:id` resolve um alerta (OPEN → RESOLVED);
+  não há exclusão por HTTP.
+
+```powershell
+npm run alerts:process                        # uma rodada manual (seguro junto com a API)
+npm run alerts:retention                      # simulação da retenção (nada é apagado)
+```
+
+## IA local opcional (Ollama)
+
+`POST /api/v1/admin/security-alerts/:id/explanation` pede a um modelo **local** uma explicação em
+texto do alerta. A IA **não detecta, não decide, não grava e não altera nada**.
+
+- Desligada por padrão (`ALERTS_AI_ENABLED=false` responde `status: "disabled"`).
+- `OLLAMA_URL` só aceita `localhost`, `127.0.0.1` ou `::1`.
+- Recebe só regra, severidade, números e duração: nunca IP, email, ids ou datas.
+- Saída validada com Zod e limitada em tamanho; falhas e timeouts viram `status: "unavailable"`.
+
+```powershell
+ollama pull qwen2.5:7b            # feito por você; a API nunca baixa modelos
+# no .env: ALERTS_AI_ENABLED=true
+```
+
+Medido nesta máquina com `qwen2.5:7b`: ~14 s na primeira chamada (carga do modelo) e ~1,3 s com
+o modelo carregado. O modelo às vezes interpreta números de forma imprecisa: a explicação é apoio
+à análise humana, nunca evidência.
+
+## Como executar
+
+### Requisitos
+
+- Node.js 24 (`.nvmrc`)
+- Docker Desktop (ou Docker Engine com Compose)
+- Opcional: Ollama, para as explicações por IA
+
+### Passo a passo (PowerShell; em bash, troque `Copy-Item` por `cp`)
+
+```powershell
+npm install                          # dependências + Prisma Client
+Copy-Item .env.example .env          # depois preencha JWT_ACCESS_SECRET e RATE_LIMIT_HMAC_SECRET
+npm run docker:up                    # PostgreSQL (127.0.0.1:5433) e Redis (127.0.0.1:6379)
+npm run db:migrate:deploy            # aplica as migrations no banco de desenvolvimento
+npm run db:seed                      # usuários fictícios (opcional)
+npm run dev                          # http://127.0.0.1:3000
+```
+
+Gere cada segredo (rode duas vezes, um valor para cada variável):
 
 ```powershell
 node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
 ```
 
-Se você já tinha um `.env` de etapas anteriores, rode também `npm run db:migrate:deploy`. As
-migrations das Etapas 4 a 6 só acrescentam valores a enums.
+Se faltar alguma configuração, a API não sobe e diz qual variável corrigir e como.
 
-`TRUST_PROXY=true` agora é **recusado** na inicialização (veja [Rate limiting](#rate-limiting)).
-Use `false`, o número de proxies ou a lista de IPs/CIDRs dos proxies.
+- **Docker Compose:** só publica portas em `127.0.0.1`. O PostgreSQL usa a porta **5433** para não
+  conflitar com uma instalação local na 5432. O banco de testes `authapi_test` é criado no
+  primeiro `docker:up`.
+- **Migrations:** `npm run db:migrate:deploy` aplica as pendentes (o mesmo comando do CI);
+  `npm run db:migrate` é para criar migrations novas durante o desenvolvimento.
+- **Seed:** cria `ada.admin@example.com`, `bruno.user@example.com` e `carla.user@example.com`, todos
+  `USER`, com a senha de `SEED_USER_PASSWORD`. Recusa produção e bancos não locais. Para testar o
+  papel ADMIN:
 
-O PostgreSQL do Docker usa a porta **5433** para não conflitar com um PostgreSQL instalado
-localmente na 5432. As portas são publicadas apenas em `127.0.0.1`.
+  ```powershell
+  npm run admin:promote -- --email ada.admin@example.com --confirm ada.admin@example.com
+  ```
 
-## Endpoints disponíveis
+- **Swagger:** <http://127.0.0.1:3000/docs> (OpenAPI em `/docs/json`). Use **Authorize** com o
+  `accessToken` do login.
+- **Saúde:** `/health` (liveness) e `/ready` (PostgreSQL e Redis; `503` se algum cair).
 
-| Método | Rota                                            | Acesso   | Descrição                                                                |
-| ------ | ----------------------------------------------- | -------- | ------------------------------------------------------------------------ |
-| GET    | `/health`                                       | público  | Liveness do processo                                                     |
-| GET    | `/ready`                                        | público  | Readiness: PostgreSQL e Redis (200 ou 503)                               |
-| POST   | `/api/v1/auth/register`                         | público  | Cadastro (papel USER), retorna 201                                       |
-| POST   | `/api/v1/auth/login`                            | público  | Cria uma sessão e devolve access token + refresh token                   |
-| POST   | `/api/v1/auth/refresh`                          | público* | Troca o refresh token por um par novo (rotação obrigatória)              |
-| POST   | `/api/v1/auth/logout`                           | Bearer   | Encerra a sessão atual (204)                                             |
-| POST   | `/api/v1/auth/logout-all`                       | Bearer   | Encerra todas as sessões do usuário (204)                                |
-| GET    | `/api/v1/users/me`                              | Bearer   | Perfil do usuário autenticado                                            |
-| PATCH  | `/api/v1/users/me`                              | Bearer   | Altera nome e/ou email (o email exige `currentPassword`)                 |
-| GET    | `/api/v1/admin/users`                           | ADMIN    | Lista usuários: paginação, filtros e ordenação controlada                |
-| GET    | `/api/v1/admin/users/:id`                       | ADMIN    | Consulta um usuário (404 se não existir)                                 |
-| GET    | `/api/v1/admin/audit-events`                    | ADMIN    | Trilha de auditoria: filtros por tipo, usuário e período                 |
-| GET    | `/api/v1/admin/security-alerts`                 | ADMIN    | Alertas de segurança: paginação e filtros por regra, severidade e estado |
-| GET    | `/api/v1/admin/security-alerts/:id`             | ADMIN    | Consulta um alerta (404 se não existir)                                  |
-| POST   | `/api/v1/admin/security-alerts/:id/explanation` | ADMIN    | Explicação por IA local (opcional; desligada por padrão)                 |
-| POST   | `/api/v1/auth/forgot-password`                  | público  | Pede o link de recuperação (sempre 202, exista ou não a conta)           |
-| POST   | `/api/v1/auth/reset-password`                   | público  | Redefine a senha com o token do link e encerra todas as sessões          |
-| GET    | `/docs`                                         | público  | Swagger UI (desligável com `SWAGGER_ENABLED`)                            |
-
-\* Não exige o access token: a credencial é o próprio refresh token, enviado no corpo.
-
-Fora da área `/admin`, nenhuma rota recebe id de usuário: o perfil é sempre o do token.
-
-### Controle de acesso (RBAC)
-
-| Recurso                                       | Anônimo    | USER                       | ADMIN                       |
-| --------------------------------------------- | ---------- | -------------------------- | --------------------------- |
-| `register`, `login`, `refresh`                | ✔          | ✔                          | ✔                           |
-| `logout`, `logout-all`                        | 401        | ✔ (só as próprias sessões) | ✔ (só as próprias sessões)  |
-| `GET`/`PATCH /users/me`                       | 401        | ✔ (só o próprio perfil)    | ✔ (só o próprio perfil)     |
-| `GET /admin/users`, `/admin/users/:id`        | 401        | **403**                    | ✔                           |
-| `GET /admin/audit-events`                     | 401        | **403**                    | ✔                           |
-| Excluir usuário, mudar papel, redefinir senha | não existe | não existe                 | não existe (fora do escopo) |
-
-- O papel usado na decisão é o **atual do banco**, lido a cada requisição. A claim `role` do JWT
-  não autoriza nada. Por isso, promover ou rebaixar alguém vale já na próxima requisição, com o
-  mesmo token.
-- `401` significa "não sei quem é você" (token ausente, inválido, expirado ou sessão encerrada).
-  `403` significa "sei quem é, mas o papel não permite". Cada `403` é registrado como
-  `ACCESS_DENIED` na auditoria.
-- `role` enviado pelo cliente (no body, na query ou num header como `x-user-role`) é ignorado
-  ou rejeitado.
-
-### Rotas administrativas
-
-Todas são **somente leitura** e exigem `Authorization: Bearer <token de um ADMIN>`.
-
-| Parâmetro (`/admin/users`) | Valores                                      | Padrão      |
-| -------------------------- | -------------------------------------------- | ----------- |
-| `page`                     | 1 a 1000                                     | `1`         |
-| `pageSize`                 | 1 a **100** (acima disso: 400)               | `20`        |
-| `email`                    | trecho do email (curingas `%`/`_` são texto) | —           |
-| `role`                     | `USER` ou `ADMIN`                            | —           |
-| `sort`                     | `createdAt`, `email` ou `name`               | `createdAt` |
-| `order`                    | `asc` ou `desc`                              | `desc`      |
-
-| Parâmetro (`/admin/audit-events`) | Valores                                                                                            | Padrão |
-| --------------------------------- | -------------------------------------------------------------------------------------------------- | ------ |
-| `page`, `pageSize`                | como acima (máximo de 100)                                                                         | 1, 20  |
-| `type`                            | `LOGIN_SUCCESS`, `LOGIN_FAILURE`, `LOGOUT`, `LOGOUT_ALL`, `TOKEN_REUSE_DETECTED`, `ACCESS_DENIED`… | —      |
-| `userId`                          | UUID                                                                                               | —      |
-| `from` / `to`                     | ISO 8601 (`from` inclusive, `to` exclusive)                                                        | —      |
-| `order`                           | `asc` ou `desc` (por `createdAt` e `id`, ordem estável)                                            | `desc` |
-
-Parâmetro desconhecido, repetido ou fora da lista gera `400 VALIDATION_ERROR`. A resposta da
-listagem tem o formato `{ "data": [...], "pagination": { "page", "pageSize", "total", "totalPages" } }`.
+### Produção (build)
 
 ```powershell
-$h = @{ Authorization = "Bearer $($adminLogin.accessToken)" }
-Invoke-RestMethod -Uri "$api/admin/users?role=USER&sort=name&order=asc&page=1&pageSize=2" -Headers $h
-Invoke-RestMethod -Uri "$api/admin/users/01a19475-1655-72e9-9bf4-e6a743ff8e29" -Headers $h
-Invoke-RestMethod -Uri "$api/admin/audit-events?type=ACCESS_DENIED&from=2026-11-01T00:00:00Z&pageSize=5" -Headers $h
+npm run build
+$env:NODE_ENV = "production"; npm start
 ```
 
-Respostas reais do servidor compilado:
+Antes de qualquer implantação, leia [`docs/production-readiness.md`](docs/production-readiness.md).
 
-```jsonc
-// GET /admin/users?email=demo%40admin-test.example.com&role=USER&sort=name&order=asc&pageSize=2 → 200
-{ "data": [
-    { "id": "01a19475-1655-72e9-9bf4-e6a743ff8e29", "name": "Bruno Demo", "email": "bruno.demo@admin-test.example.com",
-      "role": "USER", "createdAt": "2026-11-01T00:14:23.829Z", "updatedAt": "2026-11-01T00:14:23.829Z" },
-    { "id": "01a19475-1683-762f-a2cd-091f3d70b649", "name": "Carla Demo", "email": "carla.demo@admin-test.example.com",
-      "role": "USER", "createdAt": "2026-11-01T00:14:23.875Z", "updatedAt": "2026-11-01T00:14:23.875Z" } ],
-  "pagination": { "page": 1, "pageSize": 2, "total": 2, "totalPages": 1 } }
-
-// GET /admin/audit-events?type=ACCESS_DENIED&userId=… → 200 (sem email, hash de email, tokens ou senhas)
-{ "data": [ { "id": "01a19475-2171-7228-ac8e-4aec2d012fb6", "type": "ACCESS_DENIED",
-              "userId": "01a19475-1655-72e9-9bf4-e6a743ff8e29", "ip": "127.0.0.1",
-              "metadata": { "role": "USER", "route": "/api/v1/admin/users", "method": "GET", "requiredRoles": "ADMIN" },
-              "createdAt": "2026-11-01T00:14:26.673Z" } ],
-  "pagination": { "page": 1, "pageSize": 5, "total": 1, "totalPages": 1 } }
-
-// GET /admin/users como USER → 403
-{ "error": { "code": "FORBIDDEN", "message": "Seu papel não permite acessar este recurso", "requestId": "b01c5978-..." } }
-
-// GET /admin/users?pageSize=101 → 400
-{ "error": { "code": "VALIDATION_ERROR", "message": "Dados de entrada inválidos", "requestId": "d543bbed-...",
-             "details": [{ "field": "querystring.pageSize", "message": "pageSize pode ser no máximo 100" }] } }
-
-// GET /admin/users/0190a000-0000-7000-8000-0000000000ff → 404
-{ "error": { "code": "NOT_FOUND", "message": "Usuário não encontrado", "requestId": "76956443-..." } }
-```
-
-### Como testar o papel ADMIN localmente
-
-Não existe endpoint que promova usuários. Em desenvolvimento, use o comando local, que só
-altera o papel (não cria nem lê senhas):
+## Testes
 
 ```powershell
-npm run db:seed    # cria ada.admin@example.com, bruno.user@example.com e carla.user@example.com como USER
-npm run admin:promote -- --email ada.admin@example.com --confirm ada.admin@example.com
+npm run docker:up          # a integração usa o PostgreSQL e o Redis do Compose
+npm test                   # tudo
+npm run test:unit          # só unitários (sem Docker)
+npm run test:integration   # só integração (banco authapi_test)
+npm run test:coverage      # com cobertura
 ```
 
-```
-Banco: authapi em 127.0.0.1
-✔ ada.admin@example.com agora é ADMIN (id …).
-  O papel vale na próxima requisição: não é preciso novo login.
-```
+- **677 testes** (40 arquivos), executados nesta máquina com sucesso.
+- A integração roda contra PostgreSQL e Redis reais, num banco separado (`authapi_test`), com
+  dados fictícios (domínios `example.com`, IPs de faixas reservadas). `prisma migrate deploy` é
+  aplicado automaticamente antes da suíte.
+- Cobertura de cenários de segurança e resiliência: concorrência (refresh, reset, resolução de
+  alertas), reuso de token, Redis e PostgreSQL indisponíveis, reinício do servidor e do motor,
+  transação lenta real, eventos atrasados, path traversal, ausência de segredos em logs e
+  respostas, falhas e timeouts da IA.
 
-Depois, faça login com `ada.admin@example.com` e a senha `SEED_USER_PASSWORD`, use o
-**Authorize** do Swagger e experimente as rotas da tag **Admin**. Com `bruno.user@example.com`,
-as mesmas rotas devolvem `403`.
-
-Travas do comando:
-
-- recusa `NODE_ENV=production` e qualquer ambiente que não seja `development` ou `test`;
-- recusa bancos que não sejam locais;
-- só aceita emails de domínios reservados para exemplos (`example.com`/`.org`/`.net`, `.test`,
-  `.example`, `.invalid`, `.localhost`), então não alcança contas reais;
-- exige repetir o email em `--confirm`;
-- nunca é executado pelo seed.
-
-### Autenticação em resumo
-
-- **Access token:** JWT HS256 válido por 15 minutos, com as claims `sub`, `sid`, `role`, `iat`
-  e `exp`. A cada requisição, a API confere a assinatura e também se a **sessão** continua ativa
-  no PostgreSQL. Por isso, logout e revogação valem na hora, sem esperar o token expirar.
-- **Refresh token:** valor opaco de 256 bits, de **uso único**. Cada refresh devolve um par
-  novo. Reapresentar um token já trocado há menos de 10 s devolve `409` (corrida legítima entre
-  abas). Depois disso, a sessão inteira é revogada.
-- **Sessão:** dura no máximo 30 dias desde o login, e a rotação nunca estende esse prazo.
-- O fluxo completo, as ameaças consideradas e as limitações estão em
-  [`docs/architecture.md`](docs/architecture.md#etapa-4-autenticação-e-sessões).
-
-### Rate limiting
-
-Os contadores ficam no **Redis compartilhado**, então o limite vale para todas as instâncias da
-API juntas. Cada contador é atualizado por um script Lua atômico (`INCR` + `PEXPIRE`) e expira
-sozinho com a janela.
-
-| Endpoint                     | Limite padrão | Janela | Por                   | Redis fora do ar |
-| ---------------------------- | ------------- | ------ | --------------------- | ---------------- |
-| `POST /auth/login`           | 5             | 15 min | IP                    | 503 (fechado)    |
-| `POST /auth/login`           | 10            | 1 h    | conta (HMAC do email) | 503 (fechado)    |
-| `POST /auth/register`        | 5             | 1 h    | IP                    | 503 (fechado)    |
-| `POST /auth/refresh`         | 20            | 15 min | IP                    | 503 (fechado)    |
-| `POST /auth/logout`          | 20            | 15 min | usuário               | libera (aberto)  |
-| `POST /auth/logout-all`      | 5             | 15 min | usuário               | libera (aberto)  |
-| `PATCH /users/me`            | 10            | 15 min | usuário               | 503 (fechado)    |
-| `GET /admin/users`           | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
-| `GET /admin/users/:id`       | 60            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
-| `GET /admin/audit-events`    | 30            | 1 min  | usuário (ADMIN)       | libera (aberto)  |
-| `POST /auth/forgot-password` | 5             | 1 h    | IP                    | 503 (fechado)    |
-| `POST /auth/forgot-password` | 3             | 1 h    | conta (HMAC do email) | 503 (fechado)    |
-| `POST /auth/reset-password`  | 10            | 15 min | IP                    | 503 (fechado)    |
-
-`/health`, `/ready`, `/docs` e `GET /users/me` não têm limite. Os valores são **defaults de
-desenvolvimento**: ajuste-os por variável de ambiente (`RATE_LIMIT_LOGIN_IP=5/15m` etc., ver
-`.env.example`) com base em métricas reais de uso.
-
-- **IP e conta no login.** O limite por IP vem primeiro, antes de ler o corpo. O limite por conta
-  (10/h, contando todos os IPs juntos) só é consumido se o de IP passou. Assim, quem distribui
-  tentativas por muitos IPs esbarra na conta, e um único IP já bloqueado não consegue travar a
-  conta de outra pessoa.
-- **Usuário autenticado.** Nas rotas autenticadas, o limite roda **depois** da autenticação. Um
-  anônimo sempre recebe `401`, nunca `429`. Nas rotas admin, o limite roda antes da checagem de
-  papel, o que também contém um USER que insista em rotas admin.
-- **Chaves no Redis:** `authapi:rl:<política>:<escopo>:<HMAC-SHA256>`. IPs, emails e ids nunca
-  aparecem em texto (nem como SHA-256 simples, que seria reversível por dicionário). A chave do
-  HMAC (`RATE_LIMIT_HMAC_SECRET`) é separada do JWT e precisa ser estável.
-- **Redis fora do ar.** Login, cadastro, refresh e `PATCH /users/me` respondem
-  `503 SERVICE_UNAVAILABLE`, com mensagem genérica: nunca `401`, para não parecer credencial
-  inválida. Logout e consultas admin seguem funcionando, pois bloqueá-las não protege nada.
-- **Auditoria.** Um evento `RATE_LIMIT_EXCEEDED` é gravado só no **primeiro** bloqueio de cada
-  chave na janela. Um atacante recebendo milhões de `429` gera no máximo um registro por janela.
-
-**TRUST_PROXY** decide de onde vem o IP:
-
-| Valor                      | Quando usar                                      | X-Forwarded-For                                          |
-| -------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
-| `false` (padrão)           | Desenvolvimento local, API exposta diretamente   | Ignorado: o IP é o da conexão TCP                        |
-| `1`                        | Atrás de **um** proxy reverso (nginx, Caddy, LB) | Só o endereço que o proxy anexou é usado                 |
-| `10.0.0.0/8,172.16.0.0/12` | Proxies com IPs conhecidos                       | Aceito apenas se a conexão vier desses IPs               |
-| `true`                     | **Recusado na inicialização**                    | Usaria o primeiro valor do header, que o cliente escolhe |
-
-Com o padrão `false`, mandar `X-Forwarded-For: 1.2.3.4` não muda nada: o limite continua
-contando o IP real da conexão. Há teste para cada modo.
-
-**Resposta 429** (real, do servidor compilado):
-
-```http
-HTTP/1.1 429 Too Many Requests
-x-ratelimit-limit: 5
-x-ratelimit-remaining: 0
-x-ratelimit-reset: 900
-retry-after: 900
-
-{"error":{"code":"RATE_LIMITED","message":"Muitas requisições. Tente novamente em 900 s.","requestId":"c13d1bc1-...","details":{"retryAfterSeconds":900}}}
-```
-
-A mensagem é a mesma para os limites de IP, conta e usuário. A resposta não diz qual limite
-estourou nem se a conta existe. O limite por conta não envia `X-RateLimit-*`: o "remaining" de
-um email revelaria tentativas feitas por terceiros.
-
-**Testar manualmente** (Git Bash ou WSL, com a API em `npm run dev`):
-
-```bash
-for i in 1 2 3 4 5 6; do
-  curl -s -o /dev/null -w "tentativa $i: %{http_code}\n" -X POST http://127.0.0.1:3000/api/v1/auth/login \
-    -H 'content-type: application/json' -H "x-forwarded-for: 10.0.0.$i" \
-    -d '{"email":"teste@example.com","password":"senha errada porem longa"}'
-done
-# tentativa 1..5: 401 · tentativa 6: 429 (o X-Forwarded-For trocado não ajuda)
-```
-
-No Swagger, execute `POST /api/v1/auth/login` seis vezes: a sexta resposta é `429`, e os
-cabeçalhos aparecem em _Response headers_. Para repetir o teste antes de a janela acabar, apague
-**só** as chaves do ambiente local:
-`docker compose exec redis redis-cli --scan --pattern 'authapi:rl:*' | xargs -r docker compose exec -T redis redis-cli del`.
-Nunca use `FLUSHALL`.
-
-### Auditoria
-
-Toda ação sensível gera **um** evento em `audit_events`, gravado **depois** de a ação ser
-confirmada. Só o ADMIN consulta a trilha, em `GET /api/v1/admin/audit-events`.
-
-| Evento                   | Quando                                                     | Metadados (nunca senha, token ou email em texto)          |
-| ------------------------ | ---------------------------------------------------------- | --------------------------------------------------------- |
-| `LOGIN_SUCCESS`          | Login aceito                                               | `sessionId`                                               |
-| `LOGIN_FAILURE`          | Senha errada ou email inexistente                          | `reason`                                                  |
-| `LOGOUT` / `LOGOUT_ALL`  | Encerramento de uma sessão ou de todas                     | `sessionId` / `revokedSessions`                           |
-| `TOKEN_REUSE_DETECTED`   | Refresh token reutilizado fora da janela (sessão revogada) | `sessionId`, `secondsSinceRotation`                       |
-| `PROFILE_UPDATED`        | Nome e/ou email alterados                                  | `fields`, `emailChanged`, `otherSessionsRevoked`          |
-| `PROFILE_UPDATE_DENIED`  | Troca de email recusada                                    | `reason` (`INVALID_CURRENT_PASSWORD`, `EMAIL_IN_USE`)     |
-| `PASSWORD_RESET_REQUEST` | Pedido de recuperação (conta existente ou não)             | `outcome`                                                 |
-| `PASSWORD_RESET_SUCCESS` | Senha redefinida                                           | `revokedSessions`                                         |
-| `ACCESS_DENIED`          | 403 por papel insuficiente                                 | `method`, `route` (padrão), `requiredRoles`, `role`       |
-| `RATE_LIMIT_EXCEEDED`    | Primeiro 429 de uma chave na janela                        | `policy`, `scope`, `limit`, `windowSeconds`               |
-| `ADMIN_USERS_LISTED`     | ADMIN listou usuários                                      | paginação, `role`, `emailFilter` (sim/não), `resultCount` |
-| `ADMIN_USER_VIEWED`      | ADMIN consultou um usuário (inclusive 404)                 | `targetUserId`, `found`                                   |
-| `ADMIN_AUDIT_QUERIED`    | ADMIN consultou a auditoria                                | paginação, filtros usados, `resultCount`                  |
-
-- **Privacidade:** o email entra só como SHA-256 (`emailHash`), que a API não devolve. O
-  trecho pesquisado no filtro de email do ADMIN não é guardado. Os IPs são guardados para
-  investigar abuso.
-- **Append-only no banco:** um trigger recusa `UPDATE` e `DELETE` em `audit_events`. A única
-  exceção é a rotina de retenção, e não existe endpoint de edição ou exclusão.
-- **Retenção:** 180 dias para eventos comuns e 365 para sinais de ataque e responsabilização.
-  A rotina é **manual** e só simula por padrão:
+Verificações de qualidade:
 
 ```powershell
-npm run audit:retention                                         # simulação: só conta
-$env:AUDIT_RETENTION_ENABLED='true'; npm run audit:retention -- --execute --confirm <nome-do-banco>
+npm run lint; npm run typecheck; npm run format:check; npm run build; npm audit
 ```
 
-Fora de produção, a exclusão só roda em bancos `*_test`: o banco de desenvolvimento nunca é
-apagado. Detalhes, limitações e riscos em
-[`docs/architecture.md`](docs/architecture.md#etapa-8-auditoria-avançada).
+## Endpoints
 
-### Alertas de segurança
+| Método | Rota                                            | Acesso  | Descrição                                                  |
+| ------ | ----------------------------------------------- | ------- | ---------------------------------------------------------- |
+| GET    | `/health`                                       | público | Liveness                                                   |
+| GET    | `/ready`                                        | público | Readiness: PostgreSQL e Redis (200 ou 503)                 |
+| POST   | `/api/v1/auth/register`                         | público | Cadastro (sempre `USER`)                                   |
+| POST   | `/api/v1/auth/login`                            | público | Cria sessão; devolve access token e refresh token          |
+| POST   | `/api/v1/auth/refresh`                          | token¹  | Rotação do refresh token                                   |
+| POST   | `/api/v1/auth/logout`                           | Bearer  | Encerra a sessão atual                                     |
+| POST   | `/api/v1/auth/logout-all`                       | Bearer  | Encerra todas as sessões                                   |
+| POST   | `/api/v1/auth/forgot-password`                  | público | Pede o link de recuperação (sempre `202`)                  |
+| POST   | `/api/v1/auth/reset-password`                   | token²  | Redefine a senha e encerra todas as sessões                |
+| GET    | `/api/v1/users/me`                              | Bearer  | Perfil                                                     |
+| PATCH  | `/api/v1/users/me`                              | Bearer  | Nome e/ou email (o email exige `currentPassword`)          |
+| GET    | `/api/v1/admin/users`                           | ADMIN   | Usuários: paginação, filtros, ordenação                    |
+| GET    | `/api/v1/admin/users/:id`                       | ADMIN   | Um usuário                                                 |
+| GET    | `/api/v1/admin/audit-events`                    | ADMIN   | Auditoria: filtros por tipo, usuário e período             |
+| GET    | `/api/v1/admin/security-alerts`                 | ADMIN   | Alertas: paginação, filtros por regra, severidade e estado |
+| GET    | `/api/v1/admin/security-alerts/:id`             | ADMIN   | Um alerta (+ quais eventos de amostra ainda existem)       |
+| PATCH  | `/api/v1/admin/security-alerts/:id`             | ADMIN   | Resolve o alerta (`{"status":"RESOLVED","note":"..."}`)    |
+| POST   | `/api/v1/admin/security-alerts/:id/explanation` | ADMIN   | Explicação por IA local (opcional)                         |
 
-Um **motor de regras determinísticas** lê a trilha de auditoria e gera alertas persistidos em
-`security_alerts`. Ele roda **fora das requisições**: em rodadas periódicas (a cada 60 s) e a
-partir de um checkpoint salvo no PostgreSQL, que permite retomar de onde parou após um
-reinício. Não bloqueia contas nem age sobre usuários.
+¹ A credencial é o refresh token no corpo. ² A credencial é o token de recuperação no corpo.
 
-| Regra                  | Dispara quando (padrão)                                 | Evento lido              | Severidade             |
-| ---------------------- | ------------------------------------------------------- | ------------------------ | ---------------------- |
-| `BRUTE_FORCE_ACCOUNT`  | ≥ 8 falhas de login para a mesma conta em 1 h           | `LOGIN_FAILURE`          | MEDIUM (HIGH com ≥ 16) |
-| `CREDENTIAL_STUFFING`  | Um IP falhando em ≥ 5 contas diferentes em 1 h          | `LOGIN_FAILURE`          | HIGH                   |
-| `TOKEN_REUSE`          | Refresh token reutilizado fora da janela (≥ 1 em 24 h)  | `TOKEN_REUSE_DETECTED`   | HIGH                   |
-| `RATE_LIMIT_ABUSE`     | O mesmo IP bloqueado pelo rate limit ≥ 3 vezes em 1 h   | `RATE_LIMIT_EXCEEDED`    | LOW (MEDIUM com ≥ 6)   |
-| `ADMIN_ACCESS_PROBING` | Um usuário com ≥ 5 acessos negados a rotas admin em 1 h | `ACCESS_DENIED`          | MEDIUM (HIGH com ≥ 10) |
-| `PASSWORD_RESET_ABUSE` | ≥ 5 pedidos de recuperação do mesmo IP em 1 h           | `PASSWORD_RESET_REQUEST` | LOW (MEDIUM com ≥ 10)  |
+Todos os erros seguem `{ "error": { "code", "message", "requestId", "details"? } }`. As rotas
+admin aplicam, nesta ordem, autenticação (401), rate limit por usuário (429) e papel (403); cada
+403 e cada consulta administrativa são auditados.
 
-- **Limites e janelas** configuráveis por variável de ambiente (`ALERT_BRUTE_FORCE_ACCOUNT=8/1h`
-  etc.). A severidade **sobe** ao atingir o dobro do limite e **nunca desce**.
-- **Deduplicação deslizante:** enquanto a mesma regra e o mesmo alvo tiverem atividade com
-  intervalos menores que `ALERTS_DEDUP_WINDOW_HOURS` (24 h), o incidente é **um** alerta
-  aberto, mesmo atravessando a meia-noite. Novas ocorrências somam em `eventCount`. Depois de
-  um intervalo maior que a janela, ou se o alerta estiver `RESOLVED`, abre-se um alerta novo.
-  O advisory lock do motor e o índice único parcial do PostgreSQL impedem duplicatas mesmo com
-  gravações simultâneas.
-- **Evidências:** limite, janela, pico, tipo de evento, alvo e até 10 ids de eventos. O alvo é
-  o `userId` quando existe, ou o IP nas regras em que o IP é o próprio alvo. **Nunca** email,
-  hash de email, senha ou token.
+| Código                            | Status | Quando                                                       |
+| --------------------------------- | ------ | ------------------------------------------------------------ |
+| `VALIDATION_ERROR`                | 400    | Entrada fora do schema (campos listados em `details`)        |
+| `WEAK_PASSWORD`                   | 400    | Senha recusada pela política (motivo em `details.reason`)    |
+| `CURRENT_PASSWORD_REQUIRED`       | 400    | Troca de email sem `currentPassword`                         |
+| `INVALID_RESET_TOKEN`             | 400    | Link de recuperação inválido, expirado ou já usado           |
+| `UNAUTHORIZED`                    | 401    | Header `Authorization: Bearer` ausente ou malformado         |
+| `INVALID_TOKEN` / `TOKEN_EXPIRED` | 401    | Access token inválido / vencido (faça refresh)               |
+| `INVALID_SESSION`                 | 401    | Sessão encerrada ou expirada                                 |
+| `INVALID_CREDENTIALS`             | 401    | Email ou senha inválidos (mesma resposta para os dois casos) |
+| `INVALID_REFRESH_TOKEN`           | 401    | Refresh token desconhecido, expirado ou de sessão encerrada  |
+| `REFRESH_TOKEN_REUSED`            | 401    | Reuso fora da janela: a sessão foi revogada                  |
+| `FORBIDDEN`                       | 403    | Papel sem permissão                                          |
+| `INVALID_CURRENT_PASSWORD`        | 403    | Senha atual errada na troca de email                         |
+| `NOT_FOUND`                       | 404    | Recurso ou rota inexistente                                  |
+| `CONFLICT`                        | 409    | Email já em uso                                              |
+| `REFRESH_TOKEN_ALREADY_ROTATED`   | 409    | Token trocado há menos de 10 s: use o par mais recente       |
+| `ALERT_ALREADY_RESOLVED`          | 409    | Alerta já resolvido (RESOLVED é terminal)                    |
+| `RATE_LIMITED`                    | 429    | Limite excedido: veja `Retry-After`                          |
+| `SERVICE_UNAVAILABLE`             | 503    | Rate limit indisponível (Redis fora do ar) em rota sensível  |
+| `INTERNAL_ERROR`                  | 500    | Falha inesperada (mensagem genérica; detalhes só no log)     |
 
-```powershell
-$h = @{ Authorization = "Bearer $($adminLogin.accessToken)" }
-Invoke-RestMethod -Uri "$api/admin/security-alerts?status=OPEN&severity=HIGH&page=1&pageSize=20" -Headers $h
-Invoke-RestMethod -Uri "$api/admin/security-alerts/<id>" -Headers $h
-Invoke-RestMethod -Method Post -Uri "$api/admin/security-alerts/<id>/explanation" -Headers $h
-npm run alerts:process   # rodada manual (seguro junto com a API)
+## Variáveis de ambiente
+
+Todas estão documentadas, com valores seguros de exemplo, em [`.env.example`](.env.example) (um
+teste garante que nenhuma fique de fora). As principais:
+
+| Variável                                               | Padrão                  | Para quê                                                |
+| ------------------------------------------------------ | ----------------------- | ------------------------------------------------------- |
+| `DATABASE_URL` / `REDIS_URL`                           | —                       | Conexões (obrigatórias)                                 |
+| `JWT_ACCESS_SECRET` / `RATE_LIMIT_HMAC_SECRET`         | —                       | Segredos (obrigatórios, ≥ 32 caracteres, diferentes)    |
+| `NODE_ENV`                                             | `development`           | Ativa as validações de produção                         |
+| `CORS_ORIGINS`                                         | vazio                   | Origens permitidas (sem `*` em produção)                |
+| `TRUST_PROXY`                                          | `false`                 | Número de proxies ou lista de IPs/CIDRs                 |
+| `SWAGGER_ENABLED`                                      | ligado fora de produção | Documentação em `/docs`                                 |
+| `JWT_ACCESS_TTL_SECONDS`                               | `900`                   | Validade do access token                                |
+| `REFRESH_TOKEN_TTL_DAYS` / `SESSION_ABSOLUTE_TTL_DAYS` | `7` / `30`              | Validade do refresh token e da sessão                   |
+| `RATE_LIMIT_*`                                         | ver `.env.example`      | Políticas `<máximo>/<janela>`                           |
+| `MAIL_PROVIDER`                                        | `log`                   | `log` (só metadados) ou `dev-mailbox` (arquivo, só dev) |
+| `ALERTS_ENGINE_*`, `ALERT_*`, `ALERTS_*`               | ver `.env.example`      | Motor de alertas, regras, deduplicação e retenção       |
+| `ALERTS_AI_ENABLED`, `OLLAMA_*`                        | desligado               | IA local opcional                                       |
+| `AUDIT_RETENTION_*`                                    | desligado               | Retenção da auditoria                                   |
+
+## Estrutura de pastas
+
+```
+src/
+  app.ts              # composition root: plugins, módulos, motor de alertas
+  server.ts           # entrada: listen, sinais, encerramento gracioso
+  config/env.ts       # validação Zod de todas as variáveis
+  infra/              # Prisma, Redis, logger (redação)
+  plugins/swagger.ts
+  shared/             # erros, error handler, Argon2id, tarefas em segundo plano
+  modules/
+    auth/             # login, refresh, logout, JWT, middleware authenticate/requireRole
+    users/            # cadastro, perfil, política de senhas
+    admin/            # consultas administrativas
+    password-reset/   # recuperação de senha
+    mail/             # provedores de email (log, dev-mailbox)
+    rate-limit/       # políticas, store Redis, hooks
+    audit/            # gravação e retenção da auditoria
+    alerts/           # regras, motor, deduplicação, ciclo de vida, retenção, IA
+    health/           # liveness e readiness
+prisma/               # schema, migrations, seed
+scripts/              # promote-admin, audit-retention, alerts-process, alerts-retention
+tests/unit · tests/integration · tests/helpers
+docs/                 # architecture.md, production-readiness.md
+.github/workflows/    # ci.yml
 ```
 
-```jsonc
-// GET /admin/security-alerts?rule=BRUTE_FORCE_ACCOUNT → 200 (real, servidor compilado)
-{ "data": [ { "id": "…", "rule": "BRUTE_FORCE_ACCOUNT", "severity": "MEDIUM", "status": "OPEN",
-              "summary": "8 ou mais falhas de login para a mesma conta em 1 h", "eventCount": 1,
-              "details": { "threshold": 8, "windowSeconds": 3600, "peak": 8, "eventType": "LOGIN_FAILURE",
-                           "subject": { "kind": "account", "userId": "01a194f4-…" }, "sampleEventIds": ["…"] },
-              "userId": "01a194f4-…", "firstSeenAt": "…", "lastSeenAt": "…", "resolvedAt": null, … } ],
-  "pagination": { "page": 1, "pageSize": 20, "total": 1, "totalPages": 1 } }
-```
+## CI/CD
 
-**IA local opcional (explicação).** `POST /admin/security-alerts/:id/explanation` pede a um
-modelo **local** (Ollama) uma explicação em texto. Ela é **desligada por padrão** (`"status": "disabled"`).
-A IA não detecta, não decide, não grava e não altera nada: só explica, e a resposta vem marcada
-com `"advisory": true`. Para habilitar:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) roda em pushes para `main`, em pull requests
+e manualmente:
 
-```powershell
-ollama pull qwen2.5:7b                       # feito por você; a API nunca baixa modelos
-# no .env: ALERTS_AI_ENABLED=true  (OLLAMA_URL só aceita localhost/127.0.0.1/::1)
-```
+1. **quality:** `npm ci`, Prisma Client, lint, typecheck, formatação, build e testes unitários.
+2. **integration:** PostgreSQL 18 e Redis 8 como serviços, `prisma migrate deploy`, verificação de
+   que schema e migrations estão em sincronia e testes de integração.
+3. **dependencies:** `npm audit --audit-level=high` (bloqueia high/critical; moderate vai para o
+   resumo do job) e verificação de assinaturas do registro.
 
-```jsonc
-// POST /admin/security-alerts/:id/explanation → 200 (real, qwen2.5:7b local, ~2 s com o modelo carregado)
-{ "status": "ok", "advisory": true, "model": "qwen2.5:7b",
-  "explanation": { "summary": "Houve tentativas de login fracassadas para a mesma conta em um período de 1 hora.",
-                   "likelyCauses": ["Ataque de força bruta", "Autenticação inválida"],
-                   "suggestedChecks": ["Verificar atividade suspeita", "Ajustar configurações de autenticação"] } }
+Só valores fictícios, nenhum segredo do repositório e nenhuma dependência do Ollama. Não há
+etapa de deploy (CD) de propósito: ver [Próximas evoluções](#próximas-evoluções).
 
-// Ollama fora do ar, lento demais ou resposta fora do formato → 200, alerta intacto
-{ "status": "unavailable", "advisory": true, "reason": "TIMEOUT" }   // ou UNREACHABLE / INVALID_RESPONSE
-```
+## Limitações conhecidas
 
-A IA recebe só a regra, a severidade, os números e a duração do incidente: nunca IP, email, ids
-ou datas absolutas. A primeira chamada pode demorar enquanto o modelo é carregado na memória.
-Medido aqui: ultrapassou 90 s a frio e levou 2 s depois. Detalhes, limitações e falsos
-positivos em [`docs/architecture.md`](docs/architecture.md#etapa-9-motor-de-alertas-de-segurança).
+- **Cadastro revela se um email já existe** (`409`): trade-off consciente de usabilidade, mitigado
+  pelo rate limit; detalhes em `docs/architecture.md`.
+- **Sem troca de senha autenticada** (só pelo fluxo de recuperação) e **sem MFA**.
+- **Email real não é enviado:** os provedores são `log` e `dev-mailbox`; produção precisa de um
+  provedor SMTP/API.
+- **Regras de alerta por limiar fixo:** sem correlação entre regras nem baseline por usuário. IPs
+  compartilhados (NAT/CGNAT) geram falsos positivos.
+- **Eventos que confirmam mais de 24 h atrasados** (configurável) não são reavaliados pelo motor;
+  são contados e registrados no log.
+- **HS256 com segredo compartilhado:** adequado a um serviço único; para vários consumidores
+  verificando tokens, chaves assimétricas (EdDSA/RS256) seriam melhores.
+- **Retenções são manuais** (sem agendador embutido).
+- O dono do banco pode desabilitar o trigger append-only: a proteção é contra a aplicação, não
+  contra um DBA malicioso.
 
-### Recuperação de senha
+## Próximas evoluções
 
-1. `POST /api/v1/auth/forgot-password` com `{"email": "..."}` responde **sempre `202`** com a
-   mesma mensagem, exista ou não a conta. A busca da conta, a criação do token e o envio do
-   email acontecem **depois** da resposta, então nem o tempo de resposta denuncia a conta
-   (medido no servidor compilado: 14,65 ms com conta e 14,42 ms sem).
-2. Se a conta existir, chega um email com o link
-   `PASSWORD_RESET_URL#token=<token>`. O token vai no **fragmento** (`#`), que o navegador
-   nunca envia a servidores nem coloca no cabeçalho `Referer`.
-3. `POST /api/v1/auth/reset-password` com `{"token": "...", "newPassword": "..."}` troca a senha
-   e **encerra todas as sessões** da conta, inclusive a de quem estiver usando a senha antiga.
-   A rota não faz login: entre de novo com a nova senha.
+- Provedor de email real (SMTP/SES) com fila e retentativas.
+- MFA (TOTP/WebAuthn) e troca de senha autenticada.
+- Métricas (Prometheus/OpenTelemetry) e notificação de alertas HIGH.
+- Imagem Docker da aplicação e pipeline de deploy com migrations controladas.
+- Chaves assimétricas com rotação (JWKS).
+- Agendamento das retenções (cron externo) com relatórios.
 
-| Regra           | Valor                                                                                                     |
-| --------------- | --------------------------------------------------------------------------------------------------------- |
-| Token           | 256 bits aleatórios (base64url). No banco fica só o **SHA-256**. Nunca aparece em resposta ou log         |
-| Validade        | 15 minutos (`PASSWORD_RESET_TOKEN_TTL_MINUTES`)                                                           |
-| Uso único       | Consumido de forma atômica. Com requisições simultâneas, só uma vence (testado com 5 em paralelo)         |
-| Nova senha      | Mesma política do cadastro. Uma senha fraca **não** queima o link                                         |
-| Depois do reset | Os outros links da conta deixam de valer e todas as sessões são revogadas (`PASSWORD_RESET`)              |
-| Erro de token   | Sempre `400 INVALID_RESET_TOKEN` "Link de recuperação inválido ou expirado" (inválido, expirado ou usado) |
+## Licença
 
-```powershell
-Invoke-RestMethod -Method Post -Uri "$api/auth/forgot-password" -ContentType 'application/json' `
-  -Body '{"email":"bruno.user@example.com"}'
-Invoke-RestMethod -Method Post -Uri "$api/auth/reset-password" -ContentType 'application/json' `
-  -Body '{"token":"<token do link>","newPassword":"girassol teimoso na janela azul"}'
-```
-
-```jsonc
-// POST /auth/forgot-password → 202 (idêntico para conta existente e inexistente)
-{ "message": "Se o email estiver cadastrado, você receberá as instruções para redefinir a senha." }
-
-// POST /auth/reset-password → 200
-{ "message": "Senha redefinida. Entre novamente com a nova senha." }
-
-// POST /auth/reset-password com token inválido, expirado ou já usado → 400
-{ "error": { "code": "INVALID_RESET_TOKEN", "message": "Link de recuperação inválido ou expirado", "requestId": "31a41ee6-..." } }
-
-// POST /auth/reset-password com senha comum → 400 (o link continua valendo)
-{ "error": { "code": "WEAK_PASSWORD", "message": "Esta senha é muito comum. Prefira uma frase com várias palavras",
-             "requestId": "e9063c93-...", "details": { "reason": "COMMON_PASSWORD" } } }
-```
-
-**Testar localmente, sem serviço de email pago.** No `.env`, defina
-`MAIL_PROVIDER=dev-mailbox` e reinicie o `npm run dev`. Cada email vira um arquivo `.txt` em
-`.dev-mailbox/`, pasta que está no `.gitignore`:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "$api/auth/forgot-password" -ContentType 'application/json' `
-  -Body '{"email":"bruno.user@example.com"}'
-Get-ChildItem .dev-mailbox | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content
-# ... http://localhost:5173/reset-password#token=<TOKEN> → copie o valor depois de "#token="
-```
-
-- **Padrão (`MAIL_PROVIDER=log`):** registra só o tipo e a validade do email, nunca o token nem o
-  destinatário, e **não entrega nada**. É o único provedor permitido em produção até existir uma
-  integração real. A API avisa no log ao subir com ele em produção.
-- **`dev-mailbox`:** é **recusado** com `NODE_ENV=production`, porque grava tokens em disco.
-- **Provedor real:** basta implementar a interface `Mailer` (`src/modules/mail/mailer.ts`) e
-  registrá-lo em `createMailer`. Os testes automatizados usam o `MemoryMailer`, injetado
-  diretamente no app.
-
-### Política de senhas
-
-12 a 128 caracteres, qualquer caractere (passphrases são bem-vindas), **sem** regras de
-composição. São rejeitadas senhas comuns, repetições, sequências e senhas que contêm o nome
-ou o email. Detalhes em [`docs/architecture.md`](docs/architecture.md#política-de-senhas-nist-sp-800-63b).
-
-### Demonstração pelo Swagger
-
-1. Abra <http://127.0.0.1:3000/docs>.
-2. **POST `/api/v1/auth/register`** → _Try it out_, informe `name`, `email` e `password` → _Execute_.
-3. **POST `/api/v1/auth/login`** com o mesmo email e senha. Copie o `accessToken` e o `refreshToken`.
-4. Clique em **Authorize** (cadeado no topo) e cole **apenas o access token**, sem o prefixo
-   `Bearer`, que o Swagger acrescenta. Confirme.
-5. **GET `/api/v1/users/me`** devolve o seu perfil. Sem o Authorize, a resposta é `401`.
-6. **PATCH `/api/v1/users/me`** com `{"name": "Novo Nome"}`. Para trocar o email, envie também
-   `currentPassword`.
-7. **POST `/api/v1/auth/refresh`** com `{"refreshToken": "..."}` devolve um par novo. Executar
-   de novo com o token **antigo** devolve `409`. Atualize o Authorize com o access token novo.
-8. **POST `/api/v1/auth/logout`** devolve `204`. Repetir o `GET /users/me` agora dá `401`.
-9. Com `MAIL_PROVIDER=dev-mailbox`, **POST `/api/v1/auth/forgot-password`** gera o email em
-   `.dev-mailbox/`. Use o token do link em **POST `/api/v1/auth/reset-password`**.
-
-### Exemplos (PowerShell)
-
-Respostas reais do servidor compilado (tokens encurtados com `…`):
-
-```powershell
-$api = 'http://127.0.0.1:3000/api/v1'
-$body = '{"name":"Diego Ramos","email":"  Diego.Ramos@Example.com ","password":"cavalo correto bateria grampo"}'
-Invoke-RestMethod -Method Post -Uri "$api/auth/register" -ContentType 'application/json' -Body $body
-
-$login = Invoke-RestMethod -Method Post -Uri "$api/auth/login" -ContentType 'application/json' `
-  -Body '{"email":"diego.ramos@example.com","password":"cavalo correto bateria grampo"}'
-$headers = @{ Authorization = "Bearer $($login.accessToken)" }
-
-Invoke-RestMethod -Uri "$api/users/me" -Headers $headers
-Invoke-RestMethod -Method Patch -Uri "$api/users/me" -Headers $headers -ContentType 'application/json' `
-  -Body '{"email":"diego.novo@example.com","currentPassword":"cavalo correto bateria grampo"}'
-
-$pair = Invoke-RestMethod -Method Post -Uri "$api/auth/refresh" -ContentType 'application/json' `
-  -Body (@{ refreshToken = $login.refreshToken } | ConvertTo-Json)
-Invoke-RestMethod -Method Post -Uri "$api/auth/logout" -Headers @{ Authorization = "Bearer $($pair.accessToken)" }
-```
-
-```jsonc
-// POST /auth/register → 201 (email normalizado, papel USER, sem senha nem hash)
-{ "id": "01a18fbd-841e-756f-8ade-d42aca744f97", "name": "Diego Ramos",
-  "email": "diego.ramos@example.com", "role": "USER",
-  "createdAt": "2026-10-31T02:15:24.447Z", "updatedAt": "2026-10-31T02:15:24.447Z" }
-
-// POST /auth/login → 200
-{ "accessToken": "eyJhbGciOiJI…", "tokenType": "Bearer", "expiresIn": 900,
-  "refreshToken": "5UE-inkItReR…", "refreshTokenExpiresAt": "2026-11-07T23:51:46.810Z" }
-
-// POST /auth/login → 401 (idêntico para senha errada e email inexistente)
-{ "error": { "code": "INVALID_CREDENTIALS", "message": "Email ou senha inválidos", "requestId": "212ea92f-..." } }
-
-// GET /users/me sem token → 401
-{ "error": { "code": "UNAUTHORIZED", "message": "Autenticação necessária: envie Authorization: Bearer <token>", "requestId": "60f3b6e8-..." } }
-
-// POST /auth/refresh com um token já trocado (há menos de 10 s) → 409, nenhum token emitido
-{ "error": { "code": "REFRESH_TOKEN_ALREADY_ROTATED",
-             "message": "Este refresh token acabou de ser trocado por outro. Use o par de tokens mais recente.", "requestId": "51f62992-..." } }
-
-// PATCH /users/me com senha atual errada → 403
-{ "error": { "code": "INVALID_CURRENT_PASSWORD", "message": "Senha atual incorreta", "requestId": "9fc54835-..." } }
-
-// PATCH /users/me com {"role":"ADMIN"} → 400
-{ "error": { "code": "VALIDATION_ERROR", "message": "Dados de entrada inválidos", "requestId": "5582959f-...",
-             "details": [{ "field": "body", "message": "Unrecognized key: \"role\"" }] } }
-
-// Qualquer rota protegida depois do logout (ou de sessão revogada) → 401
-{ "error": { "code": "INVALID_SESSION", "message": "Sessão inválida ou encerrada", "requestId": "b7f7bd7f-..." } }
-```
-
-| Código de erro                  | Status | Quando                                                      |
-| ------------------------------- | ------ | ----------------------------------------------------------- |
-| `UNAUTHORIZED`                  | 401    | Header `Authorization: Bearer` ausente ou malformado        |
-| `INVALID_TOKEN`                 | 401    | Assinatura, algoritmo, emissor ou formato inválido          |
-| `TOKEN_EXPIRED`                 | 401    | Access token vencido: faça refresh                          |
-| `INVALID_SESSION`               | 401    | Sessão encerrada (logout, revogação) ou expirada            |
-| `INVALID_CREDENTIALS`           | 401    | Email ou senha inválidos                                    |
-| `INVALID_REFRESH_TOKEN`         | 401    | Refresh token desconhecido, expirado ou de sessão encerrada |
-| `REFRESH_TOKEN_REUSED`          | 401    | Token reutilizado fora da janela: a sessão foi revogada     |
-| `REFRESH_TOKEN_ALREADY_ROTATED` | 409    | Token trocado há menos de 10 s: use o par mais recente      |
-| `FORBIDDEN`                     | 403    | Papel sem permissão para o recurso                          |
-| `INVALID_CURRENT_PASSWORD`      | 403    | Senha atual errada na troca de email                        |
-| `INVALID_RESET_TOKEN`           | 400    | Link de recuperação inválido, expirado ou já usado          |
-| `RATE_LIMITED`                  | 429    | Limite de requisições excedido: veja `Retry-After`          |
-| `SERVICE_UNAVAILABLE`           | 503    | Proteção contra abuso indisponível (Redis fora do ar)       |
-
-### Usuários fictícios do seed
-
-| Email                    | Papel ao criar                     |
-| ------------------------ | ---------------------------------- |
-| `ada.admin@example.com`  | USER (promova com `admin:promote`) |
-| `bruno.user@example.com` | USER                               |
-| `carla.user@example.com` | USER                               |
-
-A senha de todos é o valor de `SEED_USER_PASSWORD` no seu `.env`. O seed se recusa a rodar
-com `NODE_ENV=production` ou contra um banco que não seja local. Desde a Etapa 5, o seed não
-cria administradores e não altera o papel de contas que já existem. Se o seu banco local já
-tinha `ada.admin@example.com` como ADMIN (seed da Etapa 2), ela continua ADMIN.
-
-## Scripts
-
-| Comando                                                    | O que faz                                                                        |
-| ---------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `npm run dev`                                              | Servidor com reload automático (tsx watch)                                       |
-| `npm run build`                                            | Compila para `dist/`                                                             |
-| `npm start`                                                | Executa o build compilado                                                        |
-| `npm run lint`                                             | ESLint com regras type-checked                                                   |
-| `npm run typecheck`                                        | Checagem de tipos sem emitir arquivos                                            |
-| `npm run format` / `format:check`                          | Prettier                                                                         |
-| `npm test`                                                 | Todos os testes (a integração exige `npm run docker:up`)                         |
-| `npm run test:unit`                                        | Apenas testes unitários (sem Docker)                                             |
-| `npm run test:integration`                                 | Apenas integração (banco `authapi_test` e Redis)                                 |
-| `npm run test:coverage`                                    | Testes com relatório de cobertura                                                |
-| `npm run docker:up`                                        | Sobe PostgreSQL e Redis e espera os healthchecks                                 |
-| `npm run docker:stop`                                      | Para os containers (os dados nos volumes são mantidos)                           |
-| `npm run db:migrate`                                       | Cria/aplica migrations em desenvolvimento (`prisma migrate dev`)                 |
-| `npm run db:migrate:deploy`                                | Aplica migrations pendentes sem gerar novas (CI/produção)                        |
-| `npm run db:seed`                                          | Popula o banco de desenvolvimento com dados fictícios                            |
-| `npm run admin:promote -- --email <e> --confirm <e>`       | Promove um usuário fictício local a ADMIN (bloqueado em produção)                |
-| `npm run audit:retention [-- --execute --confirm <banco>]` | Retenção da auditoria: simula por padrão; apagar exige habilitação e confirmação |
-| `npm run alerts:process`                                   | Uma rodada do motor de alertas (cron/manual; seguro junto com a API)             |
-| `npm run db:studio`                                        | Abre o Prisma Studio                                                             |
-| `npm run db:generate`                                      | Regenera o Prisma Client após mudar o schema                                     |
+MIT

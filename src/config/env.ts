@@ -81,6 +81,15 @@ const rateLimitSpec = (fallback: string) =>
       return { max, windowMs };
     });
 
+/** Comando para gerar um segredo forte (citado nas mensagens de erro de configuração). */
+const SECRET_HINT = `gere com: node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`;
+
+/** Segredo obrigatório de pelo menos 32 caracteres, com mensagem que diz como resolver. */
+const secret = () =>
+  z
+    .string({ error: `obrigatória; ${SECRET_HINT}` })
+    .min(32, `precisa ter pelo menos 32 caracteres; ${SECRET_HINT}`);
+
 export const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -90,13 +99,20 @@ export const envSchema = z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
     CORS_ORIGINS: csvList,
-    SWAGGER_ENABLED: z.stringbool().default(true),
+    /** Padrão: ligado fora de produção e DESLIGADO em produção (mapa da API para atacantes). */
+    SWAGGER_ENABLED: z.stringbool().optional(),
     TRUST_PROXY: trustProxySchema,
-    DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
-    REDIS_URL: z.url({ protocol: /^rediss?$/ }),
+    DATABASE_URL: z.url({
+      protocol: /^postgres(ql)?$/,
+      error: 'obrigatória: URL postgresql://usuario:senha@host:porta/banco (veja .env.example)',
+    }),
+    REDIS_URL: z.url({
+      protocol: /^rediss?$/,
+      error: 'obrigatória: URL redis://host:porta (veja .env.example)',
+    }),
     // HS256 com chave curta é quebrável offline a partir de um único token capturado.
     // 32 caracteres é o piso; o .env.example gera 48 bytes aleatórios (64 em base64url).
-    JWT_ACCESS_SECRET: z.string().min(32, 'precisa ter pelo menos 32 caracteres'),
+    JWT_ACCESS_SECRET: secret(),
     JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(900),
     /** Validade de cada refresh token; a rotação emite um novo, limitado pela sessão. */
     REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(7),
@@ -109,7 +125,7 @@ export const envSchema = z
      * Chave do HMAC-SHA256 que pseudonimiza IPs, emails e ids nas chaves do Redis. Precisa ser
      * ESTÁVEL (trocar zera todos os contadores) e diferente do segredo do JWT.
      */
-    RATE_LIMIT_HMAC_SECRET: z.string().min(32, 'precisa ter pelo menos 32 caracteres'),
+    RATE_LIMIT_HMAC_SECRET: secret(),
     /** Namespace das chaves no Redis. Os testes usam um prefixo próprio e aleatório. */
     RATE_LIMIT_KEY_PREFIX: z
       .string()
@@ -147,6 +163,7 @@ export const envSchema = z
     RATE_LIMIT_ADMIN_SECURITY_ALERTS: rateLimitSpec('60/1m'),
     RATE_LIMIT_ADMIN_SECURITY_ALERT_BY_ID: rateLimitSpec('60/1m'),
     RATE_LIMIT_ADMIN_SECURITY_ALERT_EXPLAIN: rateLimitSpec('10/1m'),
+    RATE_LIMIT_ADMIN_SECURITY_ALERT_UPDATE: rateLimitSpec('30/1m'),
     // --- Motor de alertas (Etapa 9) ---
     /** Liga a avaliação periódica dentro da API. Também há o comando `npm run alerts:process`. */
     ALERTS_ENGINE_ENABLED: z.stringbool().default(true),
@@ -157,6 +174,13 @@ export const envSchema = z
     ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS: z.coerce.number().int().min(1).max(720).default(24),
     /** Um incidente com a mesma regra e alvo vira um único alerta dentro desta janela. */
     ALERTS_DEDUP_WINDOW_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+    /**
+     * Eventos que confirmam atrasados (created_at antes do checkpoint) são reavaliados até
+     * este prazo após o seu created_at; mais velhos são só contados e logados.
+     */
+    ALERTS_ENGINE_MAX_LATENESS_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+    /** Duração máxima de um alerta; depois, a atividade abre um alerta novo ligado ao anterior. */
+    ALERTS_MAX_INCIDENT_HOURS: z.coerce.number().int().min(2).max(2160).default(168),
     // Regras no formato "<limite>/<janela>": dispara quando a contagem na janela atinge o limite.
     ALERT_BRUTE_FORCE_ACCOUNT: rateLimitSpec('8/1h'),
     ALERT_CREDENTIAL_STUFFING: rateLimitSpec('5/1h'),
@@ -209,6 +233,14 @@ export const envSchema = z
         message: 'precisa ser diferente de JWT_ACCESS_SECRET',
       });
     }
+    // Garante períodos de fingerprint diferentes entre um alerta e o seu sucessor.
+    if (env.ALERTS_MAX_INCIDENT_HOURS < 2 * env.ALERTS_DEDUP_WINDOW_HOURS) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ALERTS_MAX_INCIDENT_HOURS'],
+        message: 'precisa ser pelo menos o dobro de ALERTS_DEDUP_WINDOW_HOURS',
+      });
+    }
     if (env.REFRESH_TOKEN_TTL_DAYS > env.SESSION_ABSOLUTE_TTL_DAYS) {
       ctx.addIssue({
         code: 'custom',
@@ -216,13 +248,20 @@ export const envSchema = z
         message: 'não pode ser maior que SESSION_ABSOLUTE_TTL_DAYS',
       });
     }
-  });
+  })
+  .transform((env) => ({
+    ...env,
+    SWAGGER_ENABLED: env.SWAGGER_ENABLED ?? env.NODE_ENV !== 'production',
+  }));
 
 export type Env = z.infer<typeof envSchema>;
 
 export class EnvValidationError extends Error {
   constructor(public readonly issues: string[]) {
-    super(`Variáveis de ambiente inválidas:\n${issues.map((issue) => `  - ${issue}`).join('\n')}`);
+    super(
+      `Variáveis de ambiente inválidas:\n${issues.map((issue) => `  - ${issue}`).join('\n')}\n` +
+        'Dica: copie .env.example para .env (Copy-Item .env.example .env) e ajuste os valores.',
+    );
     this.name = 'EnvValidationError';
   }
 }

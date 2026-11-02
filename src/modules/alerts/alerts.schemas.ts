@@ -21,6 +21,28 @@ export const listAlertsQuerySchema = z.strictObject({
 
 export const alertIdParamsSchema = z.strictObject({ id: z.uuid('id precisa ser um UUID') });
 
+/**
+ * Única transição permitida por HTTP: OPEN -> RESOLVED. RESOLVED é terminal (atividade nova
+ * abre outro alerta). Não há exclusão. A nota é texto puro: caracteres de controle viram
+ * espaço, espaços repetidos são reduzidos, até 500 caracteres.
+ */
+export const updateAlertBodySchema = z.strictObject({
+  status: z.literal('RESOLVED', 'a única transição permitida é para RESOLVED'),
+  note: z
+    .string()
+    .max(2000)
+    .transform((value) =>
+      value
+        .replace(/[\p{Cc}\p{Cf}]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim(),
+    )
+    .pipe(
+      z.string().min(1, 'note não pode ficar vazia').max(500, 'note pode ter até 500 caracteres'),
+    )
+    .optional(),
+});
+
 export const securityAlertSchema = z
   .object({
     id: z.uuid(),
@@ -34,10 +56,20 @@ export const securityAlertSchema = z
     firstSeenAt: z.iso.datetime(),
     lastSeenAt: z.iso.datetime(),
     resolvedAt: z.iso.datetime().nullable(),
+    resolvedById: z.uuid().nullable(),
+    resolutionNote: z.string().nullable(),
     createdAt: z.iso.datetime(),
     updatedAt: z.iso.datetime(),
   })
   .meta({ id: 'SecurityAlert' });
+
+/**
+ * Consulta individual: inclui quais `details.sampleEventIds` ainda existem na auditoria. Os ids
+ * são referências opacas; a retenção da auditoria pode apagar os eventos, e isso nunca é erro.
+ */
+export const securityAlertDetailSchema = securityAlertSchema
+  .extend({ retainedSampleEventIds: z.array(z.uuid()) })
+  .meta({ id: 'SecurityAlertDetail' });
 
 export const securityAlertListSchema = z
   .object({
@@ -87,8 +119,25 @@ export function toAlertDto(alert: AlertView) {
     firstSeenAt: alert.firstSeenAt.toISOString(),
     lastSeenAt: alert.lastSeenAt.toISOString(),
     resolvedAt: alert.resolvedAt?.toISOString() ?? null,
+    resolvedById: alert.resolvedById,
+    resolutionNote: alert.resolutionNote,
     createdAt: alert.createdAt.toISOString(),
     updatedAt: alert.updatedAt.toISOString(),
+  };
+}
+
+/** `details.sampleEventIds` como lista de strings, tolerando dados antigos ou malformados. */
+export function sampleEventIdsOf(alert: AlertView): string[] {
+  const ids = asRecord(alert.details).sampleEventIds;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+}
+
+export function toAlertDetailDto(alert: AlertView, retainedSampleEventIds: readonly string[]) {
+  const retained = new Set(retainedSampleEventIds);
+  return {
+    ...toAlertDto(alert),
+    // Na ordem original dos ids, só os que ainda existem.
+    retainedSampleEventIds: sampleEventIdsOf(alert).filter((id) => retained.has(id)),
   };
 }
 

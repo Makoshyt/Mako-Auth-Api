@@ -92,6 +92,7 @@ async function cleanup() {
     where: { NOT: { fingerprint: { startsWith: 'db-test:' } } },
   });
   await prisma.detectionCheckpoint.deleteMany({ where: { name: CHECKPOINT_NAME } });
+  await prisma.detectionFlaggedEvent.deleteMany();
   await purgeAuditEvents(prisma, {
     where: {
       OR: [
@@ -370,18 +371,135 @@ describe('processamento, deduplicação e recuperação', () => {
     ]);
   });
 
-  it('LIMITAÇÃO documentada: evento gravado com horário anterior ao checkpoint não é reavaliado', async () => {
+  it('evento atrasado (confirmado depois de o checkpoint passar do seu created_at) é avaliado uma única vez', async () => {
     await startCheckpointAt(ago(10 * MIN));
     await runDetection(prisma, engine());
-    // Simula um INSERT que só confirmou depois que o checkpoint já passou do horário dele
-    // (mais atrasado que ALERTS_ENGINE_LAG_SECONDS). Na aplicação, os INSERTs de auditoria são
-    // instantâneos e o lag (5 s) cobre essa folga; ver docs/architecture.md.
+    // Reproduz o problema original: um INSERT que só aparece depois que o checkpoint já passou
+    // do horário dele. Até a Etapa 9, estes eventos nunca eram avaliados (teste antigo:
+    // "LIMITAÇÃO documentada"). Agora o horizonte de transações (xid8) os encontra.
     for (let i = 0; i < 3; i++)
-      await event('RATE_LIMIT_EXCEEDED', ago(5 * MIN), { ip: `${NET}5.9` });
+      await event('RATE_LIMIT_EXCEEDED', ago(5 * MIN - i), { ip: `${NET}5.9` });
+
+    const result = await runDetection(prisma, engine());
+
+    expect(result).toMatchObject({ lateEvents: 3, skippedLateEvents: 0, created: 1 });
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([
+      expect.objectContaining({ eventCount: 1, status: 'OPEN' }),
+    ]);
+    // Idempotente: rodar de novo não reconta nada.
+    await runDetection(prisma, engine());
+    await runDetection(prisma, engine());
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([
+      expect.objectContaining({ eventCount: 1 }),
+    ]);
+  });
+
+  it('transação lenta real: o motor roda enquanto o INSERT está aberto e pega o evento depois do COMMIT', async () => {
+    const ip = `${NET}5.10`;
+    await startCheckpointAt(ago(30 * MIN));
+    for (let i = 0; i < 2; i++) await event('RATE_LIMIT_EXCEEDED', ago((20 - i) * MIN), { ip });
+
+    // Transação que grava o 3º bloqueio e só confirma depois de uma rodada inteira do motor.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let inserted!: () => void;
+    const insertedSignal = new Promise<void>((resolve) => (inserted = resolve));
+    const slow = prisma.$transaction(
+      async (tx) => {
+        await tx.auditEvent.create({
+          data: { type: 'RATE_LIMIT_EXCEEDED', ip, metadata: { suite: SUITE } },
+        });
+        inserted();
+        await gate;
+      },
+      { timeout: 30_000 },
+    );
+    await insertedSignal;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // O checkpoint de tempo passa do created_at do evento ainda não confirmado.
+    const during = await runDetection(prisma, engine({ lagMs: 0 }));
+    expect(during.processedUntil?.getTime()).toBeGreaterThan(Date.now() - 5_000);
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([]);
+
+    release();
+    await slow;
+    const after = await runDetection(prisma, engine({ lagMs: 0 }));
+
+    expect(after.lateEvents).toBe(1);
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([
+      expect.objectContaining({ eventCount: 1 }),
+    ]);
+  });
+
+  it('evento atrasado além de maxLateness não é reavaliado, mas é contado (nunca some em silêncio)', async () => {
+    await startCheckpointAt(ago(10 * MIN));
+    await runDetection(prisma, engine());
+    for (let i = 0; i < 3; i++)
+      await event('RATE_LIMIT_EXCEEDED', ago(8 * MIN - i), { ip: `${NET}5.11` });
+
+    const result = await runDetection(prisma, engine({ maxLatenessMs: 2 * MIN }));
+
+    expect(result).toMatchObject({ lateEvents: 0, skippedLateEvents: 3 });
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([]);
+  });
+
+  it('evento atrasado eleva contagens já avaliadas: só os eventos que passaram a cruzar o limite somam', async () => {
+    const ip = `${NET}5.12`;
+    await startCheckpointAt(ago(30 * MIN));
+    // t1, t2, t3: o 3º atinge o limite (3/1h) → 1 evento no alerta.
+    for (const minutesAgo of [20, 19, 18])
+      await event('RATE_LIMIT_EXCEEDED', ago(minutesAgo * MIN), { ip });
+    await runDetection(prisma, engine());
+    expect((await alertsFor('RATE_LIMIT_ABUSE'))[0]).toMatchObject({ eventCount: 1 });
+
+    // Chega atrasado um evento ANTERIOR a todos (t0): t2 passa a ter contagem 3 (novo acima do
+    // limite) e t3 passa a 4 (já estava no livro-razão e não pode contar de novo).
+    await event('RATE_LIMIT_EXCEEDED', ago(25 * MIN), { ip });
+    await runDetection(prisma, engine());
+
+    const [alert] = await alertsFor('RATE_LIMIT_ABUSE');
+    expect(alert).toMatchObject({ eventCount: 2 });
+    expect(alert?.details).toMatchObject({ peak: 4 });
+  });
+
+  it('reprocessar um intervalo já avaliado (checkpoint recuado, ex.: restauração) não conta duas vezes', async () => {
+    const start = ago(30 * MIN);
+    await startCheckpointAt(start);
+    for (let i = 0; i < 6; i++)
+      await event('RATE_LIMIT_EXCEEDED', ago((20 - i) * MIN), { ip: `${NET}5.13` });
+    await runDetection(prisma, engine());
+    const first = await alertsFor('RATE_LIMIT_ABUSE');
+    expect(first[0]).toMatchObject({ eventCount: 4 });
+
+    await prisma.detectionCheckpoint.update({
+      where: { name: CHECKPOINT_NAME },
+      data: { processedUntil: start },
+    });
+    await runDetection(prisma, engine());
+
+    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([
+      expect.objectContaining({ id: first[0]?.id, eventCount: 4 }),
+    ]);
+  });
+
+  it('livro-razão é podado: entradas que não podem mais ser reavaliadas saem, as recentes ficam', async () => {
+    await startCheckpointAt(ago(30 * MIN));
+    const old = '00000000-0000-7000-8000-000000000001';
+    const recent = '00000000-0000-7000-8000-000000000002';
+    await prisma.detectionFlaggedEvent.createMany({
+      data: [
+        { rule: 'RATE_LIMIT_ABUSE', eventId: old, eventCreatedAt: ago(3 * 24 * 60 * MIN) },
+        { rule: 'RATE_LIMIT_ABUSE', eventId: recent, eventCreatedAt: ago(20 * MIN) },
+      ],
+    });
 
     await runDetection(prisma, engine());
 
-    expect(await alertsFor('RATE_LIMIT_ABUSE')).toEqual([]);
+    const left = await prisma.detectionFlaggedEvent.findMany({
+      where: { eventId: { in: [old, recent] } },
+    });
+    expect(left.map((row) => row.eventId)).toEqual([recent]);
   });
 
   it('eventos mais novos que o lag esperam a próxima rodada', async () => {
@@ -399,9 +517,12 @@ describe('processamento, deduplicação e recuperação', () => {
   it('deduplicação deslizante: incidente que atravessa a virada do período continua no mesmo alerta', async () => {
     const window = 10 * MIN;
     let now = (await dbNow()).getTime();
-    // Precisa de alguns segundos dentro do período atual para os eventos "novos".
-    if (now - Math.floor(now / window) * window < 5_000) {
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    // Precisa de alguns segundos dentro do período atual para os eventos "novos". O timeout do
+    // teste é explícito: com o padrão (5 s), esta espera estourava o tempo, o corpo seguia rodando
+    // em segundo plano segurando a trava do motor e derrubava os testes seguintes.
+    const elapsed = now - Math.floor(now / window) * window;
+    if (elapsed < 5_000) {
+      await new Promise((resolve) => setTimeout(resolve, 5_000 - elapsed + 50));
       now = (await dbNow()).getTime();
     }
     const bucketStart = Math.floor(now / window) * window;
@@ -429,7 +550,7 @@ describe('processamento, deduplicação e recuperação', () => {
       true,
     );
     expect(alerts[0]).toMatchObject({ eventCount: 4, severity: 'MEDIUM' });
-  });
+  }, 20_000); // pode esperar até 5 s pela virada do período: acima do timeout padrão (5 s)
 
   it('deduplicação deslizante: depois de um intervalo maior que a janela, a atividade vira alerta novo', async () => {
     const window = 10 * MIN;
@@ -449,6 +570,30 @@ describe('processamento, deduplicação e recuperação', () => {
     // Lote 2 ainda está na janela de 1 h da regra junto com o lote 1: os 3 eventos contam.
     expect(alerts.map((a) => a.eventCount)).toEqual([1, 3]);
     expect(alerts.every((a) => a.status === 'OPEN')).toBe(true);
+  });
+
+  it('incidente contínuo: ao passar da duração máxima abre um alerta novo ligado ao anterior', async () => {
+    const ip = `${NET}5.8`;
+    await startCheckpointAt(ago(40 * MIN));
+    // Um bloqueio a cada 2 min por 30 min: atividade contínua (pausas < janela de 5 min).
+    for (let m = 35; m >= 5; m -= 2) await event('RATE_LIMIT_EXCEEDED', ago(m * MIN), { ip });
+
+    await runDetection(
+      prisma,
+      engine({ dedupWindowMs: 5 * MIN, maxIncidentMs: 12 * MIN, maxRangeMs: 4 * MIN }),
+    );
+
+    const alerts = await alertsFor('RATE_LIMIT_ABUSE');
+    expect(alerts.length).toBeGreaterThanOrEqual(2);
+    for (const [index, alert] of alerts.entries()) {
+      expect(alert.lastSeenAt.getTime() - alert.firstSeenAt.getTime()).toBeLessThanOrEqual(
+        12 * MIN,
+      );
+      const previous = index === 0 ? undefined : alerts[index - 1]?.id;
+      expect((alert.details as { previousAlertId?: string }).previousAlertId).toBe(previous);
+    }
+    // Nada se perde na troca de alerta: 16 bloqueios, os 14 a partir do 3º acima do limite.
+    expect(alerts.reduce((sum, a) => sum + a.eventCount, 0)).toBe(14);
   });
 
   it('alerta RESOLVED não recebe continuação: a atividade nova abre outro alerta', async () => {
@@ -711,6 +856,212 @@ describe('endpoints administrativos', () => {
     }
 
     expect(statuses).toEqual([...Array<number>(10).fill(200), 429]);
+  });
+});
+
+describe('ciclo de vida: PATCH /admin/security-alerts/:id', () => {
+  async function login(local: string, role: 'USER' | 'ADMIN') {
+    const account = await user(local);
+    if (role === 'ADMIN')
+      await prisma.user.update({ where: { id: account.id }, data: { role: 'ADMIN' } });
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      payload: { email: `${local}${DOMAIN}`, password: PASSWORD },
+    });
+    return { id: account.id, token: response.json<{ accessToken: string }>().accessToken };
+  }
+
+  async function openAlert() {
+    await startCheckpointAt(ago(30 * MIN));
+    for (let i = 0; i < 3; i++)
+      await event('RATE_LIMIT_EXCEEDED', ago((20 - i) * MIN), { ip: `${NET}9.1` });
+    await runDetection(prisma, engine());
+    const [alert] = await alertsFor('RATE_LIMIT_ABUSE');
+    if (!alert) throw new Error('alerta de teste não foi criado');
+    return alert;
+  }
+
+  const patch = (id: string, payload: unknown, token?: string, target = app) =>
+    target.inject({
+      method: 'PATCH',
+      url: `/api/v1/admin/security-alerts/${id}`,
+      payload: payload as Record<string, unknown>,
+      ...(token && { headers: { authorization: `Bearer ${token}` } }),
+    } as InjectOptions);
+
+  it('ADMIN resolve: 200, grava quem/quando/nota; o alerta mantém regra, contagens e evidências', async () => {
+    const alert = await openAlert();
+    const admin = await login('resolve-adm', 'ADMIN');
+
+    const response = await patch(
+      alert.id,
+      { status: 'RESOLVED', note: '  Falso positivo:\n NAT do escritório  ' },
+      admin.token,
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: alert.id,
+      status: 'RESOLVED',
+      resolvedById: admin.id,
+      resolutionNote: 'Falso positivo: NAT do escritório',
+      eventCount: alert.eventCount,
+      rule: alert.rule,
+    });
+    const stored = await prisma.securityAlert.findUniqueOrThrow({ where: { id: alert.id } });
+    expect(stored.resolvedAt).not.toBeNull();
+    expect(stored.details).toEqual(alert.details);
+    expect(stored.fingerprint).toBe(alert.fingerprint);
+    expect(response.body).not.toContain('fingerprint');
+  });
+
+  it('transição inválida: já resolvido → 409; status diferente de RESOLVED → 400; inexistente → 404', async () => {
+    const alert = await openAlert();
+    const admin = await login('transicao-adm', 'ADMIN');
+    expect((await patch(alert.id, { status: 'RESOLVED' }, admin.token)).statusCode).toBe(200);
+
+    const again = await patch(alert.id, { status: 'RESOLVED' }, admin.token);
+    const reopen = await patch(alert.id, { status: 'OPEN' }, admin.token);
+    const missing = await patch(
+      '0190a000-0000-7000-8000-0000000000ff',
+      { status: 'RESOLVED' },
+      admin.token,
+    );
+
+    expect(again.statusCode).toBe(409);
+    expect(again.json<ErrorBody>().error.code).toBe('ALERT_ALREADY_RESOLVED');
+    expect(reopen.statusCode).toBe(400);
+    expect(missing.statusCode).toBe(404);
+  });
+
+  it.each([
+    ['campo desconhecido', { status: 'RESOLVED', severity: 'LOW' }],
+    ['nota vazia', { status: 'RESOLVED', note: '   ' }],
+    ['nota longa demais', { status: 'RESOLVED', note: 'x'.repeat(501) }],
+    ['sem status', { note: 'ok' }],
+  ])('400 para %s (validação Zod)', async (_label, payload) => {
+    const alert = await openAlert();
+    const admin = await login('valida-adm', 'ADMIN');
+
+    expect((await patch(alert.id, payload, admin.token)).statusCode).toBe(400);
+    expect((await prisma.securityAlert.findUniqueOrThrow({ where: { id: alert.id } })).status).toBe(
+      'OPEN',
+    );
+  });
+
+  it('RBAC: anônimo 401, USER 403 (e ACCESS_DENIED auditado); o alerta não muda', async () => {
+    const alert = await openAlert();
+    const regular = await login('resolve-user', 'USER');
+
+    expect((await patch(alert.id, { status: 'RESOLVED' })).statusCode).toBe(401);
+    expect((await patch(alert.id, { status: 'RESOLVED' }, regular.token)).statusCode).toBe(403);
+
+    expect((await prisma.securityAlert.findUniqueOrThrow({ where: { id: alert.id } })).status).toBe(
+      'OPEN',
+    );
+    expect(
+      await prisma.auditEvent.count({ where: { type: 'ACCESS_DENIED', userId: regular.id } }),
+    ).toBe(1);
+  });
+
+  it('cada tentativa é auditada (ADMIN_SECURITY_ALERT_UPDATED) sem o texto da nota', async () => {
+    const alert = await openAlert();
+    const admin = await login('audita-adm', 'ADMIN');
+
+    await patch(alert.id, { status: 'RESOLVED', note: 'contato: ana@example.com' }, admin.token);
+    await patch(alert.id, { status: 'RESOLVED' }, admin.token);
+
+    const events = await prisma.auditEvent.findMany({
+      where: { type: 'ADMIN_SECURITY_ALERT_UPDATED', userId: admin.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(events.map((e) => e.metadata)).toEqual([
+      { alertId: alert.id, to: 'RESOLVED', outcome: 'RESOLVED', hasNote: true },
+      { alertId: alert.id, to: 'RESOLVED', outcome: 'ALREADY_RESOLVED', hasNote: false },
+    ]);
+    expect(JSON.stringify(events)).not.toContain('ana@example.com');
+  });
+
+  it('resoluções simultâneas do mesmo alerta: exatamente uma vence (200) e as demais recebem 409', async () => {
+    const alert = await openAlert();
+    const admin = await login('corrida-adm', 'ADMIN');
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () => patch(alert.id, { status: 'RESOLVED' }, admin.token)),
+    );
+
+    expect(responses.map((r) => r.statusCode).sort()).toEqual([200, 409, 409, 409, 409]);
+  });
+
+  it('depois de resolvido, atividade nova abre OUTRO alerta (RESOLVED é terminal)', async () => {
+    const alert = await openAlert();
+    const admin = await login('terminal-adm', 'ADMIN');
+    await patch(alert.id, { status: 'RESOLVED' }, admin.token);
+
+    await event('RATE_LIMIT_EXCEEDED', null, { ip: `${NET}9.1` });
+    await runDetection(prisma, engine());
+
+    const alerts = await alertsFor('RATE_LIMIT_ABUSE');
+    expect(alerts.map((a) => a.status)).toEqual(['RESOLVED', 'OPEN']);
+  });
+
+  it('não há exclusão por HTTP: DELETE responde 404 e o alerta continua lá', async () => {
+    const alert = await openAlert();
+    const admin = await login('delete-adm', 'ADMIN');
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/admin/security-alerts/${alert.id}`,
+      headers: { authorization: `Bearer ${admin.token}` },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(await prisma.securityAlert.count({ where: { id: alert.id } })).toBe(1);
+  });
+
+  it('rate limit (padrão 30/min por ADMIN): a 31ª escrita recebe 429', async () => {
+    const strict = await buildTestApp({}, { rateLimits: 'default' } satisfies BuildTestAppOptions);
+    extraApps.push(strict);
+    const alert = await openAlert();
+    const admin = await login('limite-adm', 'ADMIN');
+
+    const codes: number[] = [];
+    for (let i = 0; i < 31; i++)
+      codes.push((await patch(alert.id, { status: 'RESOLVED' }, admin.token, strict)).statusCode);
+
+    expect(codes.slice(0, 30).every((code) => code === 200 || code === 409)).toBe(true);
+    expect(codes[30]).toBe(429);
+  });
+
+  it('consulta individual informa quais sampleEventIds ainda existem (retenção apagou o resto)', async () => {
+    const alert = await openAlert();
+    const admin = await login('retencao-adm', 'ADMIN');
+    const sampleIds = (alert.details as { sampleEventIds: string[] }).sampleEventIds;
+    expect(sampleIds.length).toBeGreaterThan(0);
+
+    const before = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/security-alerts/${alert.id}`,
+      headers: { authorization: `Bearer ${admin.token}` },
+    });
+    expect(before.json<{ retainedSampleEventIds: string[] }>().retainedSampleEventIds).toEqual(
+      sampleIds,
+    );
+
+    // Simula a retenção da auditoria apagando os eventos referenciados.
+    await purgeAuditEvents(prisma, { where: { id: { in: sampleIds } } });
+    const after = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/security-alerts/${alert.id}`,
+      headers: { authorization: `Bearer ${admin.token}` },
+    });
+
+    expect(after.statusCode).toBe(200);
+    expect(after.json()).toMatchObject({
+      retainedSampleEventIds: [],
+      details: { sampleEventIds: sampleIds },
+    });
   });
 });
 

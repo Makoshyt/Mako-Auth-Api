@@ -33,6 +33,7 @@
     "admin:promote": "tsx scripts/promote-admin.ts",
     "audit:retention": "tsx scripts/audit-retention.ts",
     "alerts:process": "tsx scripts/alerts-process.ts",
+    "alerts:retention": "tsx scripts/alerts-retention.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {
@@ -65,5 +66,9 @@
     "typescript": "6.0.3",
     "typescript-eslint": "8.72.1",
     "vitest": "5.0.5"
+  },
+  "overrides": {
+    "glob": "14.0.3",
+    "minimatch": "11.0.4"
   }
 }

@@ -12,8 +12,7 @@
 import { existsSync } from 'node:fs';
 import { EnvValidationError, loadEnv } from '../src/config/env.js';
 import { createPrismaClient } from '../src/infra/prisma.js';
-import { buildDetectionRules } from '../src/modules/alerts/alert-rules.js';
-import { runDetection } from '../src/modules/alerts/detection-engine.js';
+import { engineConfigFromEnv, runDetection } from '../src/modules/alerts/detection-engine.js';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 
@@ -27,20 +26,21 @@ try {
 
 const prisma = createPrismaClient(env.DATABASE_URL);
 try {
-  const result = await runDetection(prisma, {
-    rules: buildDetectionRules(env),
-    lagMs: env.ALERTS_ENGINE_LAG_SECONDS * 1000,
-    initialLookbackMs: env.ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS * 3_600_000,
-    dedupWindowMs: env.ALERTS_DEDUP_WINDOW_HOURS * 3_600_000,
-  });
+  const result = await runDetection(prisma, engineConfigFromEnv(env));
   if (!result.acquired) {
     console.log('Outra instância está processando agora. Nada foi feito.');
     process.exitCode = 2;
   } else {
     console.log(
       `Intervalos: ${result.iterations} · alertas criados: ${result.created} · atualizados: ${result.updated} · ` +
-        `avaliado até: ${result.processedUntil?.toISOString() ?? '—'}`,
+        `avaliado até: ${result.processedUntil?.toISOString() ?? '—'} · ` +
+        `atrasados reavaliados: ${result.lateEvents}`,
     );
+    if (result.skippedLateEvents > 0) {
+      console.warn(
+        `! ${result.skippedLateEvents} evento(s) confirmaram além de ALERTS_ENGINE_MAX_LATENESS_HOURS e não foram reavaliados.`,
+      );
+    }
     if (result.behind) {
       console.warn('! Ainda há eventos antigos para avaliar. Rode de novo.');
       process.exitCode = 3;

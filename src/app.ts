@@ -20,10 +20,13 @@ import {
   disabledExplainer,
   type AlertExplainer,
 } from './modules/alerts/alert-explainer.js';
-import { buildDetectionRules } from './modules/alerts/alert-rules.js';
 import { createAlertsRepository } from './modules/alerts/alerts.repository.js';
 import { createAlertsService } from './modules/alerts/alerts.service.js';
-import { createEngineScheduler, runDetection } from './modules/alerts/detection-engine.js';
+import {
+  createEngineScheduler,
+  engineConfigFromEnv,
+  runDetection,
+} from './modules/alerts/detection-engine.js';
 import { createAuditRecorder } from './modules/audit/audit.recorder.js';
 import { registerAuthentication } from './modules/auth/auth.middleware.js';
 import { createAuthRepository } from './modules/auth/auth.repository.js';
@@ -54,6 +57,15 @@ import { hashPassword, verifyPassword } from './shared/password-hasher.js';
  */
 export function trustProxyOption(value: Env['TRUST_PROXY']) {
   return typeof value === 'number' ? (_address: string, hop: number) => hop < value : value;
+}
+
+/**
+ * Tempo máximo para receber e responder uma requisição (o padrão do Fastify é sem limite).
+ * Corta clientes lentos que seguram conexões (slowloris). Acompanha o timeout do Ollama, para
+ * a rota de explicação conseguir devolver `unavailable: TIMEOUT` em vez de cair por aqui.
+ */
+export function requestTimeoutMs(env: Pick<Env, 'OLLAMA_TIMEOUT_MS'>): number {
+  return Math.max(30_000, env.OLLAMA_TIMEOUT_MS + 10_000);
 }
 
 export interface AppDependencies {
@@ -94,6 +106,7 @@ export async function buildApp({
     trustProxy: trustProxyOption(env.TRUST_PROXY),
     // Payloads de autenticação são pequenos; limitar reduz superfície de abuso.
     bodyLimit: 16 * 1024,
+    requestTimeout: requestTimeoutMs(env),
   }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);
@@ -177,20 +190,27 @@ export async function buildApp({
   // Motor de alertas: rodadas periódicas FORA do caminho das requisições, a partir do checkpoint
   // persistido. Começa quando o servidor fica pronto e para (esperando a rodada atual) ao fechar.
   if (env.ALERTS_ENGINE_ENABLED) {
+    const engineConfig = engineConfigFromEnv(env);
     const scheduler = createEngineScheduler(
-      () =>
-        runDetection(prisma, {
-          rules: buildDetectionRules(env),
-          lagMs: env.ALERTS_ENGINE_LAG_SECONDS * 1000,
-          initialLookbackMs: env.ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS * 3_600_000,
-          dedupWindowMs: env.ALERTS_DEDUP_WINDOW_HOURS * 3_600_000,
-        }),
+      () => runDetection(prisma, engineConfig),
       env.ALERTS_ENGINE_INTERVAL_SECONDS * 1000,
       (result) => {
-        if (result.created > 0 || result.updated > 0 || result.behind) {
+        if (result.created > 0 || result.updated > 0 || result.behind || result.lateEvents > 0) {
           app.log.info(
-            { created: result.created, updated: result.updated, behind: result.behind },
+            {
+              created: result.created,
+              updated: result.updated,
+              behind: result.behind,
+              lateEvents: result.lateEvents,
+            },
             'motor de alertas: rodada concluída',
+          );
+        }
+        // Atrasados além do prazo: não reavaliados. Fica visível no log (nunca em silêncio).
+        if (result.skippedLateEvents > 0) {
+          app.log.warn(
+            { skippedLateEvents: result.skippedLateEvents },
+            'motor de alertas: eventos confirmados além de ALERTS_ENGINE_MAX_LATENESS_HOURS não foram reavaliados',
           );
         }
       },

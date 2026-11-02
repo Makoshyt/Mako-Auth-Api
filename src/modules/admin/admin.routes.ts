@@ -17,10 +17,13 @@ import {
   alertIdParamsSchema,
   explanationResponseSchema,
   listAlertsQuerySchema,
+  securityAlertDetailSchema,
   securityAlertListSchema,
   securityAlertSchema,
+  toAlertDetailDto,
   toAlertDto,
   toExplanationDto,
+  updateAlertBodySchema,
 } from '../alerts/alerts.schemas.js';
 import type { AlertsService } from '../alerts/alerts.service.js';
 
@@ -167,13 +170,45 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
         security: bearerAuth,
         params: alertIdParamsSchema,
         response: {
-          200: securityAlertSchema,
+          200: securityAlertDetailSchema,
           ...protectedResponses,
           404: errorResponseSchema.describe('Alerta não encontrado'),
         },
       },
     },
-    async (request) => toAlertDto(await alertsService.get(request.params.id, actorOf(request))),
+    async (request) => {
+      const { alert, retainedSampleEventIds } = await alertsService.get(
+        request.params.id,
+        actorOf(request),
+      );
+      return toAlertDetailDto(alert, retainedSampleEventIds);
+    },
+  );
+
+  app.patch(
+    '/security-alerts/:id',
+    {
+      config: { rateLimit: 'adminSecurityAlertUpdate' },
+      schema: {
+        tags: ['Admin'],
+        summary: 'Resolve um alerta de segurança (OPEN → RESOLVED)',
+        description:
+          'Única transição permitida: OPEN → RESOLVED, com nota opcional (texto puro, até 500). ' +
+          'RESOLVED é terminal: atividade nova abre outro alerta. Não altera usuários nem ' +
+          'sessões e não apaga nada. Cada tentativa é auditada (ADMIN_SECURITY_ALERT_UPDATED).',
+        security: bearerAuth,
+        params: alertIdParamsSchema,
+        body: updateAlertBodySchema,
+        response: {
+          200: securityAlertSchema,
+          ...protectedResponses,
+          404: errorResponseSchema.describe('Alerta não encontrado'),
+          409: errorResponseSchema.describe('Alerta já resolvido (ALERT_ALREADY_RESOLVED)'),
+        },
+      },
+    },
+    async (request) =>
+      toAlertDto(await alertsService.resolve(request.params.id, request.body, actorOf(request))),
   );
 
   app.post(

@@ -131,6 +131,13 @@ export const POLICY_DEFINITIONS = {
     onStoreFailure: 'closed',
     exposeHeaders: true,
   },
+  // Escrita (Etapa 10): fail-closed, como as demais operações que alteram estado.
+  adminSecurityAlertUpdate: {
+    envKey: 'RATE_LIMIT_ADMIN_SECURITY_ALERT_UPDATE',
+    scope: 'user',
+    onStoreFailure: 'closed',
+    exposeHeaders: true,
+  },
 } as const satisfies Record<string, PolicyDefinition>;
 
 export type PolicyName = keyof typeof POLICY_DEFINITIONS;

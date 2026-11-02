@@ -42,6 +42,7 @@ enum AuditEventType {
   ADMIN_USER_VIEWED // ADMIN consultou um usuário pelo id
   ADMIN_AUDIT_QUERIED // ADMIN consultou a trilha de auditoria (um evento por consulta)
   ADMIN_SECURITY_ALERTS_QUERIED // ADMIN listou/consultou/pediu explicação de alertas
+  ADMIN_SECURITY_ALERT_UPDATED // ADMIN mudou o estado de um alerta (ex.: OPEN -> RESOLVED)
 }
 
 enum AlertRule {
@@ -79,7 +80,8 @@ model User {
   sessions            Session[]
   passwordResetTokens PasswordResetToken[]
   auditEvents         AuditEvent[]
-  securityAlerts      SecurityAlert[]
+  securityAlerts      SecurityAlert[]      @relation("AlertSubject")
+  resolvedAlerts      SecurityAlert[]      @relation("AlertResolver")
 
   @@map("users")
 }
@@ -139,19 +141,23 @@ model PasswordResetToken {
 
 /// Trilha de auditoria. Sem senhas, tokens ou segredos. Sobrevive à exclusão do usuário (SetNull).
 model AuditEvent {
-  id        String         @id @default(uuid(7)) @db.Uuid
+  id        String               @id @default(uuid(7)) @db.Uuid
   type      AuditEventType
-  userId    String?        @map("user_id") @db.Uuid
+  userId    String?              @map("user_id") @db.Uuid
   /// SHA-256 do email normalizado: correlaciona tentativas sem guardar o email
   /// (inclusive de contas inexistentes).
-  emailHash String?        @map("email_hash") @db.Char(64)
-  ip        String?        @db.VarChar(45)
+  emailHash String?              @map("email_hash") @db.Char(64)
+  ip        String?              @db.VarChar(45)
   /// Contexto mínimo e estruturado (ex.: { "reason": "INVALID_PASSWORD" }).
   metadata  Json?
-  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  createdAt DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// Transação que gravou o evento (pg_current_xact_id()). O motor de alertas usa o horizonte de
+  /// transações concluídas para pegar eventos que confirmaram depois do checkpoint de created_at.
+  txId      Unsupported("xid8")? @default(dbgenerated("pg_current_xact_id()")) @map("tx_id")
 
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
+  @@index([txId]) // motor de alertas: eventos confirmados desde o último horizonte
   @@index([createdAt]) // retenção (purge) e filtro por período
   @@index([type, createdAt]) // consulta administrativa por tipo + período
   @@index([userId, createdAt])
@@ -161,25 +167,30 @@ model AuditEvent {
 }
 
 model SecurityAlert {
-  id          String        @id @default(uuid(7)) @db.Uuid
-  rule        AlertRule
-  severity    AlertSeverity
-  status      AlertStatus   @default(OPEN)
+  id             String        @id @default(uuid(7)) @db.Uuid
+  rule           AlertRule
+  severity       AlertSeverity
+  status         AlertStatus   @default(OPEN)
   /// Identifica "o mesmo incidente" (regra + alvo). Único entre alertas OPEN (índice parcial).
-  fingerprint String        @db.VarChar(128)
+  fingerprint    String        @db.VarChar(128)
   /// Explicação determinística gerada pelo motor de regras.
-  summary     String        @db.VarChar(500)
+  summary        String        @db.VarChar(500)
   /// Evidências minimizadas: contagens, janela de tempo, limites aplicados.
-  details     Json
-  userId      String?       @map("user_id") @db.Uuid
-  eventCount  Int           @default(1) @map("event_count")
-  firstSeenAt DateTime      @map("first_seen_at") @db.Timestamptz(3)
-  lastSeenAt  DateTime      @map("last_seen_at") @db.Timestamptz(3)
-  resolvedAt  DateTime?     @map("resolved_at") @db.Timestamptz(3)
-  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  details        Json
+  userId         String?       @map("user_id") @db.Uuid
+  eventCount     Int           @default(1) @map("event_count")
+  firstSeenAt    DateTime      @map("first_seen_at") @db.Timestamptz(3)
+  lastSeenAt     DateTime      @map("last_seen_at") @db.Timestamptz(3)
+  resolvedAt     DateTime?     @map("resolved_at") @db.Timestamptz(3)
+  /// ADMIN que resolveu (SetNull se a conta for excluída; a auditoria guarda o histórico).
+  resolvedById   String?       @map("resolved_by_id") @db.Uuid
+  /// Nota opcional da resolução, escrita pelo ADMIN (texto puro, até 500).
+  resolutionNote String?       @map("resolution_note") @db.VarChar(500)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user       User? @relation("AlertSubject", fields: [userId], references: [id], onDelete: SetNull)
+  resolvedBy User? @relation("AlertResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
 
   // No máximo um alerta OPEN por incidente: deduplicação segura contra concorrência.
   @@unique([fingerprint], map: "security_alerts_open_fingerprint_key", where: raw("status = 'OPEN'"))
@@ -187,12 +198,30 @@ model SecurityAlert {
   @@map("security_alerts")
 }
 
-/// Progresso do motor de alertas: até onde (created_at) a trilha de auditoria já foi avaliada.
-/// Persistido para que um reinício continue de onde parou, sem perder nem repetir eventos.
+/// Progresso do motor de alertas: até onde (created_at) a trilha de auditoria já foi avaliada e
+/// o horizonte de transações (xid8) já visto. Persistido para que um reinício continue de onde
+/// parou, sem perder nem repetir eventos.
 model DetectionCheckpoint {
   name           String   @id @db.VarChar(64)
   processedUntil DateTime @map("processed_until") @db.Timestamptz(3)
+  /// pg_snapshot_xmin da última rodada: toda transação com id menor já tinha terminado.
+  txHorizon      BigInt?  @map("tx_horizon")
   updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("detection_checkpoints")
+}
+
+/// Livro-razão do motor: cada evento que já somou num alerta, por regra. Torna o
+/// reprocessamento idempotente (janela de sobreposição, eventos atrasados, reinício).
+/// Sem FK para audit_events: a retenção da auditoria apaga eventos e este registro é podado
+/// pelo próprio motor depois do prazo máximo de atraso.
+model DetectionFlaggedEvent {
+  rule           AlertRule
+  eventId        String    @map("event_id") @db.Uuid
+  eventCreatedAt DateTime  @map("event_created_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([rule, eventId])
+  @@index([eventCreatedAt])
+  @@map("detection_flagged_events")
 }

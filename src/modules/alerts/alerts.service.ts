@@ -1,13 +1,21 @@
-import { notFound } from '../../shared/errors.js';
+import { AppError, notFound } from '../../shared/errors.js';
 import type { AdminActor } from '../admin/admin.service.js';
 import type { AuditRecorder } from '../audit/audit.recorder.js';
 import type { AlertEvidence, AlertExplainer, ExplainResult } from './alert-explainer.js';
 import type { AlertView, AlertsRepository, ListAlertsQuery } from './alerts.repository.js';
+import { sampleEventIdsOf } from './alerts.schemas.js';
 
 export interface AlertsServiceDeps {
   repository: AlertsRepository;
   explainer: AlertExplainer;
   audit: AuditRecorder;
+  /** Relógio injetável (testes). */
+  now?: () => Date;
+}
+
+export interface ResolveAlertCommand {
+  status: 'RESOLVED';
+  note?: string;
 }
 
 export type AlertsService = ReturnType<typeof createAlertsService>;
@@ -41,7 +49,12 @@ export function toEvidence(alert: AlertView): AlertEvidence {
  * automática nem ação contra usuários. Cada consulta concluída gera UM evento de auditoria,
  * depois da leitura; o motor de regras não lê esse tipo de evento (sem alerta de alerta).
  */
-export function createAlertsService({ repository, explainer, audit }: AlertsServiceDeps) {
+export function createAlertsService({
+  repository,
+  explainer,
+  audit,
+  now = () => new Date(),
+}: AlertsServiceDeps) {
   const record = (actor: AdminActor, metadata: Record<string, string | number | boolean>) =>
     audit.record({
       type: 'ADMIN_SECURITY_ALERTS_QUERIED',
@@ -71,11 +84,47 @@ export function createAlertsService({ repository, explainer, audit }: AlertsServ
       return page;
     },
 
+    /** O alerta e, dos `sampleEventIds`, os que a retenção da auditoria ainda não apagou. */
     async get(id: string, actor: AdminActor) {
       const alert = await repository.findById(id);
       await record(actor, { action: 'VIEW', alertId: id, found: alert !== null });
       if (!alert) throw notFound('Alerta não encontrado');
-      return alert;
+      const retained = await repository.existingEventIds(sampleEventIdsOf(alert));
+      return { alert, retainedSampleEventIds: retained };
+    },
+
+    /**
+     * OPEN -> RESOLVED por um ADMIN. Não altera usuários, sessões, regra, contagens nem
+     * evidências; não apaga nada. Toda tentativa (inclusive recusada) gera
+     * ADMIN_SECURITY_ALERT_UPDATED, sem o texto da nota (pode conter dados pessoais).
+     */
+    async resolve(id: string, command: ResolveAlertCommand, actor: AdminActor) {
+      const resolved = await repository.resolve({
+        id,
+        resolvedById: actor.userId,
+        note: command.note ?? null,
+        at: now(),
+      });
+      const existing = resolved ? null : await repository.findById(id);
+      const outcome = resolved ? 'RESOLVED' : existing ? 'ALREADY_RESOLVED' : 'NOT_FOUND';
+      await audit.record({
+        type: 'ADMIN_SECURITY_ALERT_UPDATED',
+        userId: actor.userId,
+        ip: actor.ip,
+        metadata: {
+          alertId: id,
+          to: command.status,
+          outcome,
+          hasNote: command.note !== undefined,
+        },
+      });
+      if (resolved) return resolved;
+      if (!existing) throw notFound('Alerta não encontrado');
+      throw new AppError(
+        409,
+        'ALERT_ALREADY_RESOLVED',
+        'O alerta já está resolvido. Atividade nova gera outro alerta.',
+      );
     },
 
     /** Explicação sob demanda. Não é gravada e não altera o alerta. */

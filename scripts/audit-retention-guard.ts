@@ -1,6 +1,7 @@
 /**
- * Travas do comando `npm run audit:retention`. Separadas do CLI para serem testadas sem
- * processo. O padrão é SIMULAÇÃO (só conta); apagar exige configuração e flags explícitas.
+ * Travas dos comandos de retenção (`npm run audit:retention` e `npm run alerts:retention`).
+ * Separadas do CLI para serem testadas sem processo. O padrão é SIMULAÇÃO (só conta); apagar
+ * exige configuração e flags explícitas.
  */
 export interface RetentionRunInput {
   nodeEnv: string | undefined;
@@ -9,6 +10,8 @@ export interface RetentionRunInput {
   execute: boolean;
   /** Para executar, precisa repetir o NOME do banco de destino. */
   confirm: string | undefined;
+  /** Variável que liga a exclusão (citada na mensagem). Padrão: AUDIT_RETENTION_ENABLED. */
+  enabledVariable?: string;
 }
 
 export type RetentionRunCheck =
@@ -30,7 +33,9 @@ export function checkRetentionRun(input: RetentionRunInput): RetentionRunCheck {
 
   const errors: string[] = [];
   if (!input.enabled) {
-    errors.push('Exclusão desligada: defina AUDIT_RETENTION_ENABLED=true para executar.');
+    errors.push(
+      `Exclusão desligada: defina ${input.enabledVariable ?? 'AUDIT_RETENTION_ENABLED'}=true para executar.`,
+    );
   }
   if (input.confirm !== database.name) {
     errors.push(`Confirmação ausente ou diferente: use --confirm ${database.name}.`);

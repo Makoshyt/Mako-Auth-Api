@@ -1,23 +1,261 @@
 # Arquitetura e decisões técnicas
 
-> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 9 (motor de alertas de segurança)**.
+Este documento tem duas partes:
+
+- **Parte I: arquitetura consolidada.** Como o sistema funciona hoje (versão final, Etapa 10).
+  Comece por aqui.
+- **Parte II: histórico de decisões por etapa.** O registro de cada etapa (1 a 10), com o
+  contexto e os trade-offs de cada decisão no momento em que foi tomada. Onde uma decisão foi
+  revista depois, a Parte I e a seção da etapa posterior prevalecem.
+
+Prontidão para produção: [`production-readiness.md`](production-readiness.md).
+
+---
+
+# Parte I: arquitetura consolidada
 
 ## Visão geral
 
-Monólito modular em Fastify + TypeScript. Cada módulo de `src/modules/` segue o fluxo
-`route → service → repository → Prisma`, e as dependências são montadas manualmente em
-`src/app.ts` (composition root), sem container de injeção de dependências.
+Monólito modular em Fastify 5 + TypeScript strict. Cada módulo de `src/modules/` segue
+`route → service → repository → Prisma`. As dependências são montadas manualmente em
+`src/app.ts` (composition root), sem container de injeção. `buildApp()` não chama `listen()`:
+os testes sobem a aplicação inteira com `app.inject()`, contra PostgreSQL e Redis reais.
 
 ```mermaid
 flowchart LR
-  C[Cliente] --> F[Fastify<br/>CORS · helmet · Zod · Swagger]
-  F --> EH[Error handler global]
-  F --> R[Routes]
+  C[Cliente] --> F[Fastify<br/>CORS · helmet · Zod · requestTimeout]
+  F --> EH[Error handler global<br/>formato único de erro]
+  F --> H[Hooks: authenticate → rate limit → requireRole]
+  H --> R[Routes]
   R --> S[Services]
   S --> REPO[Repositories]
   REPO --> PG[(PostgreSQL)]
-  F -. rate limit .-> RD[(Redis)]
+  H -. contadores .-> RD[(Redis)]
+  S --> AUD[AuditRecorder] --> PG
+  ENG[Motor de alertas<br/>agendador · CLI] --> PG
+  S -. explicação opcional .-> OL[Ollama local]
 ```
+
+## Módulos e responsabilidades
+
+| Módulo           | Responsabilidade                                                                                | Depende de                           |
+| ---------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `config/env`     | Valida todas as variáveis (Zod), regras de produção, mensagens acionáveis sem valores           | —                                    |
+| `infra`          | Clientes Prisma (adapter `pg`) e Redis; logger com redação                                      | —                                    |
+| `shared`         | `AppError`, error handler, Argon2id, tarefas pós-resposta                                       | —                                    |
+| `auth`           | Login, refresh com rotação e detecção de reuso, logout, JWT, hooks `authenticate`/`requireRole` | audit, password-hasher               |
+| `users`          | Cadastro, perfil, troca de email com reautenticação, política de senhas (NIST 800-63B)          | audit                                |
+| `password-reset` | Pedido indistinguível (trabalho após a resposta), reset transacional que revoga sessões         | mail, audit, background-tasks        |
+| `mail`           | Provedores `log` e `dev-mailbox` (interface `Mailer`)                                           | —                                    |
+| `rate-limit`     | Políticas declarativas, janela fixa atômica no Redis, chaves HMAC, fail-open/closed por rota    | Redis, audit                         |
+| `audit`          | Gravação best-effort (falha nunca derruba a requisição), retenção manual                        | PostgreSQL                           |
+| `admin`          | Consultas de usuários e auditoria; plugin que impõe auth + rate limit + ADMIN em toda rota      | auth, rate-limit, alerts             |
+| `alerts`         | Regras, motor, deduplicação, ciclo de vida, retenção, explicação por IA                         | PostgreSQL, audit, Ollama (opcional) |
+| `health`         | Liveness e readiness                                                                            | PostgreSQL, Redis                    |
+
+Não há dependência circular entre módulos: `admin` consome `alerts` pela interface do service;
+o motor de alertas só lê `audit_events` e nunca chama outros módulos.
+
+## Fluxos principais
+
+- **Login:** rate limit (IP e conta) → busca credenciais → Argon2id (com hash fictício se a conta
+  não existe) → cria sessão + hash do refresh token → `LOGIN_SUCCESS`/`LOGIN_FAILURE`.
+- **Requisição autenticada:** extrai o Bearer → verifica JWT (HS256, `iss`, `aud`, claims Zod)
+  → confirma no banco que a sessão existe, é do usuário, não foi revogada nem expirou → papel
+  atual do banco.
+- **Refresh:** consumo condicional (`UPDATE … WHERE used_at IS NULL`) na mesma transação que cria
+  o próximo token. Perdedor de corrida dentro de 10 s: `409`; reuso fora da janela: sessão
+  revogada e `TOKEN_REUSE_DETECTED`.
+- **Recuperação de senha:** `202` imediato; busca, criação do token e email rodam depois da
+  resposta. O reset consome o token, troca o hash, invalida outros links e revoga todas as
+  sessões numa transação.
+- **Rota admin:** `authenticate` (401) → rate limit por usuário (429) → `requireRole('ADMIN')`
+  (403 + `ACCESS_DENIED`) → handler → evento `ADMIN_*` após a leitura.
+- **Alertas:** auditoria → rodada do motor → `security_alerts` → consulta/resolução por ADMIN.
+
+## Persistência e transações
+
+PostgreSQL é a fonte da verdade. Tabelas: `users`, `sessions`, `refresh_tokens`,
+`password_reset_tokens`, `audit_events`, `security_alerts`, `detection_checkpoints`,
+`detection_flagged_events`. Ids UUID v7; CHECKs no SQL das migrations reforçam invariantes
+(email normalizado, hashes em hex, consistência de revogação e resolução).
+
+| Operação                 | Garantia                                                                           |
+| ------------------------ | ---------------------------------------------------------------------------------- |
+| Rotação de refresh token | Transação + UPDATE condicional: só uma requisição consome o token                  |
+| Reset de senha           | Transação: consumir token, trocar senha, invalidar outros tokens, revogar sessões  |
+| Troca de email           | Transação: UPDATE + revogação das demais sessões                                   |
+| Rodada do motor          | Transação: alertas, livro-razão e checkpoint juntos (tudo ou nada) + advisory lock |
+| Resolução de alerta      | UPDATE condicional (`WHERE status = 'OPEN'`): resoluções simultâneas, um vencedor  |
+| Exclusão de auditoria    | Só em transação que declara `authapi.audit_purge` (trigger append-only)            |
+
+Argon2id roda **fora** das transações, para o custo da derivação não segurar locks.
+
+## Redis
+
+Usado apenas para contadores de rate limit (`INCR` + `PEXPIRE` atômicos via script Lua, janela
+fixa), com chaves `prefixo:política:HMAC(identificador)`: o Redis nunca vê IP, email ou id em
+claro. Sem fila offline: com o Redis fora do ar, cada política decide falhar **fechada** (login,
+cadastro, refresh, recuperação, escrita admin: `503`) ou **aberta** (leituras e logout). Perder o
+Redis zera contadores, mas não perde dados de negócio.
+
+## Auditoria
+
+`audit_events` é append-only no banco (trigger recusa `UPDATE`, exceto o `SET NULL` da FK de
+usuário, e `DELETE`/`TRUNCATE` fora da rotina de retenção). Guarda tipo, usuário, hash SHA-256 do
+email, IP, metadados mínimos e `tx_id` (transação que gravou, usado pelo motor). Nunca senhas,
+tokens ou emails em claro. A gravação é best-effort: falha vai para o log, nunca para o cliente.
+Retenção manual em duas faixas (180/365 dias), com simulação por padrão.
+
+## Motor de alertas
+
+### Processamento
+
+```mermaid
+flowchart TD
+  T[Agendador na API<br/>a cada 60 s · onReady/onClose] --> R
+  C[npm run alerts:process] --> R
+  R[runDetection] --> TX{{"Transação"}}
+  TX --> L{pg_try_advisory_xact_lock}
+  L -- ocupado --> SKIP[outra instância processa]
+  L -- livre --> HZ["horizonte = pg_snapshot_xmin(pg_current_snapshot())"]
+  HZ --> CK["from = checkpoint.processedUntil<br/>to = now() - lag (máx. 6 h por iteração)"]
+  CK --> CAND["Candidatos por regra:<br/>created_at em (from, to]<br/>+ ATRASADOS: tx_id em [horizonte anterior, horizonte) com created_at ≤ from"]
+  CAND --> WIN["Janela deslizante exata a partir do candidato mais antigo de cada alvo"]
+  WIN --> LED["Eventos acima do limite → INSERT no livro-razão ON CONFLICT DO NOTHING<br/>só os NOVOS somam"]
+  LED --> UP["Continua o alerta OPEN do alvo (dedup deslizante, até a duração máxima)<br/>ou INSERT … ON CONFLICT (fingerprint) WHERE status='OPEN'"]
+  UP --> W["checkpoint = (to, horizonte) · poda do livro-razão"]
+  W --> COMMIT[COMMIT]
+```
+
+### Checkpoint e eventos atrasados
+
+O checkpoint guarda duas coisas: até onde `created_at` já foi avaliado e o **horizonte de
+transações** (`pg_snapshot_xmin`) da rodada anterior. Toda transação com id abaixo do horizonte
+já terminou. Como cada evento grava o `tx_id` da transação que o inseriu, todo evento confirmado
+cai em exatamente um intervalo `[horizonte anterior, horizonte atual)`, não importa quando
+confirmou. Um evento cujo `created_at` ficou para trás do checkpoint (transação lenta) é
+encontrado por esse intervalo e reavaliado.
+
+- **Idempotência:** o livro-razão `detection_flagged_events (regra, evento)` registra cada evento
+  que já somou num alerta. Reprocessar a mesma região (sobreposição, checkpoint recuado,
+  restauração) nunca conta duas vezes.
+- **Fora de ordem:** um evento atrasado em `t` pode elevar a contagem de eventos em
+  `[t, t + janela]`; a região reavaliada começa em `t` e só os eventos que **passaram** a cruzar o
+  limite somam.
+- **Concorrência:** advisory lock por transação; o horizonte é lido antes das consultas, então
+  tudo abaixo dele já está visível a elas.
+- **Limite:** atrasados mais velhos que `ALERTS_ENGINE_MAX_LATENESS_HOURS` (24 h) não são
+  reavaliados, mas aparecem em `skippedLateEvents` e num `warn` no log. Uma transação longa em
+  qualquer lugar do banco segura o horizonte: atrasa a detecção de atrasados, nunca a perde.
+- **Primeira rodada após a migração:** sem horizonte anterior, nada é tratado como atrasado
+  (eventos antigos têm `tx_id` nulo).
+
+### Deduplicação
+
+1. **Continuação:** a detecção soma ao alerta `OPEN` mais recente da mesma regra e alvo cuja
+   última atividade esteja a no máximo `ALERTS_DEDUP_WINDOW_HOURS` (24 h) do início da atividade
+   nova, desde que o alerta não passe de `ALERTS_MAX_INCIDENT_HOURS` (7 dias).
+2. **Alerta novo:** `fingerprint = <regra>:<SHA-256(regra:alvo)[0..32]>:<período>`, com índice
+   único parcial (`WHERE status = 'OPEN'`) + `ON CONFLICT DO UPDATE`.
+3. **Incidente longo:** passada a duração máxima, abre-se um alerta novo com
+   `details.previousAlertId`, preservando a cadeia.
+
+Metadados não crescem sem limite: `details` é mesclado (chaves novas sobrescrevem),
+`sampleEventIds` tem no máximo 10 ids e a duração de cada alerta é limitada.
+
+### Severidade, ciclo de vida e retenção
+
+- Severidade sobe ao atingir o dobro do limite e nunca é rebaixada (`GREATEST` sobre o enum).
+- `OPEN → RESOLVED` por ADMIN (`PATCH`), com quem, quando e nota opcional. `RESOLVED` é terminal:
+  atividade nova abre outro alerta. Não há exclusão por HTTP nem ação automática contra usuários.
+- Retenção manual (`npm run alerts:retention`): só `RESOLVED` vencidos, em lotes, simulação por
+  padrão; `OPEN` nunca é apagado.
+- `sampleEventIds` são referências opacas: a auditoria pode apagá-las pela retenção, e a consulta
+  individual informa quais ainda existem (`retainedSampleEventIds`), sem erro.
+
+### Recuperação após falhas
+
+| Falha                              | Comportamento                                                                         |
+| ---------------------------------- | ------------------------------------------------------------------------------------- |
+| Processo cai no meio de uma rodada | Transação desfeita; checkpoint e livro-razão não avançam; a próxima rodada reprocessa |
+| API parada por horas               | Retoma do checkpoint em intervalos de até 6 h (até 24 por rodada); `behind: true`     |
+| Transação de auditoria lenta       | Encontrada pelo horizonte de transações na rodada seguinte ao COMMIT                  |
+| Duas instâncias / API + CLI        | Advisory lock: uma processa, a outra não faz nada                                     |
+| Banco indisponível                 | Rodada falha, erro no log (sem segredos), nova tentativa no próximo intervalo         |
+| Ollama indisponível                | Só a explicação fica `unavailable`; detecção e consulta seguem                        |
+
+## Segurança
+
+Resumo das defesas (detalhes nas etapas 3 a 7 da Parte II):
+
+- **Autenticação:** JWT HS256 com algoritmo fixo, `iss`/`aud`, claims validadas, 15 min; sessão
+  confirmada no banco a cada requisição; refresh opaco com rotação, consumo atômico e detecção de
+  reuso; validade absoluta da sessão.
+- **Senhas:** Argon2id (19 MiB, t=2, p=1), política NIST (mínimo 12, lista de senhas comuns, não
+  conter nome/email), comparação em tempo constante.
+- **Enumeração:** login com custo e mensagem iguais; recuperação indistinguível; rate limit sem
+  dizer qual limite estourou. O cadastro ainda revela email existente (ver Limitações).
+- **Autorização:** papel do banco, plugin admin que exige política de rate limit em toda rota,
+  nenhuma rota fora de `/admin` recebe id de usuário (sem IDOR), cadastro sempre `USER`.
+- **Entrada:** schemas `strictObject`, `bodyLimit` 16 KB, `requestTimeout`.
+- **Saída e logs:** DTOs campo a campo (sem spread), redação no pino, URL sem query string, erro
+  500 genérico; testes de vazamento procuram senhas, tokens e strings de conexão.
+- **Infraestrutura:** helmet, CORS por lista, `TRUST_PROXY=true` recusado, Swagger desligado por
+  padrão em produção, encerramento gracioso com prazo.
+
+## Privacidade
+
+- Email só em `users`; auditoria guarda o SHA-256; alertas nunca guardam email nem hash.
+- IP aparece na auditoria e nos alertas cujo alvo é o IP (necessário para investigar); o Redis só
+  vê HMACs.
+- A IA recebe só regra, severidade, números e duração; `OLLAMA_URL` só aceita endereços locais.
+- A nota de resolução de alerta é texto livre de ADMIN: é limitada (500) e **não** vai para a
+  auditoria (só `hasNote`).
+- Retenções configuráveis para auditoria e alertas.
+
+## Decisões técnicas e trade-offs
+
+| Decisão                                       | Alternativa considerada                     | Por quê                                                                                           |
+| --------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Monólito modular                              | Microsserviços                              | Um domínio coeso; transações locais simples; nenhum ganho de escala que justifique a complexidade |
+| JWT curto + sessão no banco                   | JWT longo sem estado                        | Revogação imediata ao custo de uma consulta por requisição                                        |
+| Refresh token opaco com rotação               | Refresh JWT                                 | Revogável, sem dados no token; o banco guarda só o hash                                           |
+| HS256                                         | RS256/EdDSA                                 | Um único serviço emite e verifica; assimétrico fica para quando houver outros consumidores        |
+| Rate limit próprio (Lua no Redis)             | `@fastify/rate-limit`                       | Limite por conta (email normalizado), chaves HMAC e fail-open/closed por política                 |
+| Detecção em rodadas a partir de checkpoint    | No caminho da requisição / fila em memória  | Não bloqueia HTTP e não perde trabalho se o processo cair                                         |
+| Horizonte `xid8` + livro-razão                | Só lag de 5 s / janela de sobreposição fixa | Garante não perder eventos atrasados sem contar duas vezes; custo: uma coluna e uma tabela        |
+| Deduplicação deslizante com duração máxima    | Períodos fixos                              | Um incidente que atravessa meia-noite é um alerta; incidentes longos ficam rastreáveis em cadeia  |
+| Retenções manuais com simulação e confirmação | Agendador embutido                          | Exclusão é irreversível; quem opera decide quando, com proteção para bancos de desenvolvimento    |
+| Argon2id nativo do Node                       | Pacote `argon2`                             | Sem compilação nativa; parâmetros OWASP                                                           |
+| IA local, opcional e só explicativa           | IA na detecção / serviço externo            | Detecção determinística e auditável; nenhum dado sai da máquina                                   |
+
+## Dependências
+
+- Versões fixadas no `package.json` e lockfile versionado.
+- **Política:** `npm audit --audit-level=high` bloqueia o CI; moderate/low são triados
+  manualmente, sem `npm audit fix --force`.
+- **`overrides` (Etapa 10):** `glob@14.0.3` e `minimatch@11.0.4`. Os pacotes `@fastify/static`
+  (via `@fastify/swagger-ui`) e o ESLint ainda declaram `glob ^13` e `minimatch ^10`, afetados por
+  GHSA-3g3m-2fjr-6pw4 e GHSA-g3hv-75wg-m249 (moderate). O impacto real era baixo: o glob só
+  lista os arquivos fixos do Swagger UI e o minimatch só recebe padrões da configuração, nunca
+  entrada do usuário. Mesmo assim, as versões corrigidas são compatíveis (Node 24) e a suíte
+  inteira passou com elas. Remover os `overrides` quando os pacotes de origem atualizarem.
+
+## Limitações
+
+- Cadastro responde `409` para email existente (enumeração possível, mitigada por rate limit).
+- Sem MFA e sem troca de senha autenticada.
+- Sem provedor de email real.
+- Regras por limiar fixo, sem correlação nem baseline; falsos positivos com IP compartilhado.
+- Atrasados além de 24 h não são reavaliados (contados e logados).
+- HS256 com segredo único: trocar o segredo invalida todos os access tokens (sem `kid`).
+- Retenções sem agendamento; trigger append-only não protege contra o dono do banco.
+- Detalhes operacionais em [`production-readiness.md`](production-readiness.md).
+
+---
+
+# Parte II: histórico de decisões por etapa
 
 ## Decisões da Etapa 1
 
@@ -1229,17 +1467,14 @@ Medido com o `qwen2.5:7b` local:
   `RATE_LIMIT_ABUSE` ou `PASSWORD_RESET_ABUSE` com usuários legítimos.
 - **Limites próximos aos do rate limit:** `PASSWORD_RESET_ABUSE` (5/h) dispara exatamente quando
   alguém esgota o limite de pedidos por IP.
-- **Evento atrasado:** um evento cujo `created_at` fique antes do checkpoint (INSERT confirmado
-  mais de `ALERTS_ENGINE_LAG_SECONDS` depois do seu `now()`) não é reavaliado. Os INSERTs de
-  auditoria são instantâneos e o lag de 5 s cobre a folga. Há um teste que **documenta** esse
-  comportamento.
-- **Incidente contínuo cresce indefinidamente:** com a deduplicação deslizante, uma atividade
-  que nunca para por mais de 24 h segue somando no mesmo alerta. `firstSeenAt`, `lastSeenAt`
-  e `eventCount` mostram a extensão real.
+- ~~**Evento atrasado**~~ **(resolvido na Etapa 10):** um evento cujo `created_at` ficasse
+  antes do checkpoint não era reavaliado. Agora o horizonte de transações (`xid8`) o encontra.
+- ~~**Incidente contínuo cresce indefinidamente**~~ **(resolvido na Etapa 10):** duração máxima
+  por alerta, com encadeamento por `previousAlertId`.
 - **Sem correlação entre regras** (ex.: stuffing seguido de login bem-sucedido) nem baseline
   por usuário. As regras são limiares fixos.
-- **Alertas só são lidos.** Resolver um alerta (`RESOLVED`) e notificar alguém ficam para
-  depois. Hoje um alerta fica `OPEN` até uma ação manual no banco.
+- ~~**Alertas só são lidos**~~ **(resolução implementada na Etapa 10:**
+  `PATCH /admin/security-alerts/:id`**).** Notificação continua pendente.
 - **IA:** modelos locais erram e generalizam. No teste manual, o modelo chamou "brute force" de
   "força-tarefa" numa chamada. A saída é apoio, nunca evidência.
 
@@ -1252,8 +1487,7 @@ Medido com o `qwen2.5:7b` local:
 - A IA local não recebe dados pessoais. Mesmo assim, se `OLLAMA_URL` apontasse para um
   servidor remoto, as evidências sairiam da máquina, e por isso a configuração recusa endereços
   não locais.
-- Alertas não entram na retenção da Etapa 8. Uma política para `security_alerts` resolvidos
-  precisa ser definida.
+- ~~Alertas não entram na retenção~~ **(Etapa 10: `npm run alerts:retention`, só RESOLVED).**
 
 ### Estratégia de recuperação após falhas
 
@@ -1283,3 +1517,76 @@ estava certo: era de fato um "brute force" contra a mesma conta.
 | `users.test.ts`: toda rota com `{id}` precisa ser admin e exigir Bearer | Surgiram `/admin/security-alerts/{id}`. A asserção antiga exigia uma única rota com id | Mais abrangente: vale para qualquer rota futura com id  |
 | `env.test.ts` e a tabela de modos de falha                              | Novas variáveis e 3 novas políticas de rate limit                                      | Novos testes para URL local do Ollama, regras e limites |
 | `auth.test.ts`: limpeza inclui o hash de `vera@auth-test`               | Vazamento descrito acima                                                               | Nenhuma asserção alterada                               |
+
+## Etapa 10: consolidação, hardening e CI
+
+### Eventos atrasados (risco da Etapa 9)
+
+**Problema reproduzido:** o teste "LIMITAÇÃO documentada" (Etapa 9) gravava eventos com
+`created_at` anterior ao checkpoint e confirmava que eles nunca viravam alerta. O novo teste
+"transação lenta real" abre uma transação que grava um evento, roda uma rodada inteira do motor
+com ela aberta (o checkpoint passa do horário do evento) e só então confirma.
+
+**Solução:** coluna `audit_events.tx_id xid8 DEFAULT pg_current_xact_id()` + horizonte
+`pg_snapshot_xmin` no checkpoint + livro-razão `detection_flagged_events`. Descrição completa na
+Parte I. Alternativas descartadas:
+
+- _Aumentar o lag ou usar uma janela de sobreposição fixa:_ reduz a chance, não elimina; e sem
+  livro-razão, reprocessar a sobreposição contaria eventos duas vezes.
+- _Sequência (`bigserial`) como cursor:_ o valor é atribuído no INSERT, não no COMMIT; tem o mesmo
+  buraco que `created_at`.
+- _Gatilho ou fila (outbox) por evento:_ acoplaria cada gravação de auditoria ao motor e exigiria
+  um consumidor a mais; o horizonte de transações dá a mesma garantia sem tocar no caminho de
+  gravação.
+
+A migration `20261103090000_alerts_lifecycle_late_events` adiciona a coluna **sem** default e só
+depois define o default: sem reescrita da tabela, eventos antigos ficam com `tx_id` nulo (nunca
+tratados como atrasados). O trigger append-only foi atualizado para exigir `tx_id` inalterado na
+única exceção de `UPDATE`.
+
+### Ciclo de vida, retenção e incidentes longos
+
+- `PATCH /api/v1/admin/security-alerts/:id`: só `OPEN → RESOLVED`, nota opcional saneada (texto
+  puro, até 500), `resolved_by_id` e `resolution_note` com CHECK de consistência, UPDATE
+  condicional contra corridas, rate limit fail-closed (30/min), auditoria
+  `ADMIN_SECURITY_ALERT_UPDATED` em toda tentativa (sem o texto da nota).
+- `npm run alerts:retention`: mesma trava da retenção da auditoria (simulação por padrão,
+  `ALERTS_RETENTION_ENABLED`, `--execute --confirm <banco>`, só `*_test` fora de produção).
+- `ALERTS_MAX_INCIDENT_HOURS` (168 h, ≥ 2× a janela de deduplicação): limita a duração de um
+  alerta e encadeia o sucessor. `details` passou a ser mesclado, para o vínculo não se perder.
+- `retainedSampleEventIds` na consulta individual.
+- Os eventos `ADMIN_SECURITY_ALERTS_QUERIED` e `ADMIN_SECURITY_ALERT_UPDATED` entraram na retenção
+  estendida da auditoria (responsabilização).
+
+### Hardening
+
+| Mudança                                                          | Motivo                                                                                     |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `requestTimeout = max(30 s, OLLAMA_TIMEOUT_MS + 10 s)`           | O Fastify não limita o tempo de requisição por padrão (clientes lentos seguravam conexões) |
+| Encerramento com prazo de 15 s e proteção contra sinal duplicado | `app.close()` travado deixava o processo pendurado                                         |
+| `SWAGGER_ENABLED` desligado por padrão em produção               | O mapa da API não deve ficar público por esquecimento                                      |
+| Mensagens de configuração com a correção (como gerar o segredo)  | Experiência de quem clona o projeto                                                        |
+| `overrides` de `glob` e `minimatch`                              | `npm audit` com 0 vulnerabilidades (ver "Dependências" na Parte I)                         |
+| Configuração do motor centralizada (`engineConfigFromEnv`)       | A API e o CLI montavam a mesma configuração em dois lugares                                |
+
+Revisão sem alteração necessária: assinatura e validação de JWT, rotação e reuso de refresh
+tokens, revogação de sessões, reset de senha, RBAC/IDOR, redação de logs, CORS, helmet, limites
+de payload e tratamento de falhas do Redis e do PostgreSQL. Os testes de resiliência novos
+confirmam que uma falha do PostgreSQL vira `500` genérico sem expor a string de conexão nem na
+resposta nem no log.
+
+### Teste instável corrigido
+
+O teste de deduplicação na virada do período (Etapa 9) espera até 5 s quando o relógio está logo
+após uma virada de 10 minutos, acima do timeout padrão do Vitest (5 s). O Vitest marcava falha,
+mas o corpo seguia rodando em segundo plano segurando a trava do motor, e os testes seguintes
+recebiam `acquired: false` (sem alertas). Correção: timeout explícito de 20 s e espera só do
+tempo restante.
+
+### Testes adaptados (e por quê)
+
+| Mudança                                                                | Motivo                                                     |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------- |
+| "LIMITAÇÃO documentada" → "evento atrasado … é avaliado uma única vez" | O comportamento documentado era o defeito corrigido        |
+| `env.test.ts`, tabela de modos de falha, `RunResult` do agendador      | Novas variáveis, nova política de rate limit, novos campos |
+| Lista de retenção estendida                                            | Dois tipos de evento administrativos acrescentados         |

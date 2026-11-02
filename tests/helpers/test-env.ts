@@ -39,6 +39,7 @@ export const RELAXED_RATE_LIMITS: Record<string, string> = Object.fromEntries(
     'ADMIN_SECURITY_ALERTS',
     'ADMIN_SECURITY_ALERT_BY_ID',
     'ADMIN_SECURITY_ALERT_EXPLAIN',
+    'ADMIN_SECURITY_ALERT_UPDATE',
   ].map((name) => [`RATE_LIMIT_${name}`, '100000/1h']),
 );
 

@@ -60,6 +60,10 @@ describe('loadEnv', () => {
       RATE_LIMIT_ADMIN_SECURITY_ALERTS: { max: 60, windowMs: 60_000 },
       RATE_LIMIT_ADMIN_SECURITY_ALERT_BY_ID: { max: 60, windowMs: 60_000 },
       RATE_LIMIT_ADMIN_SECURITY_ALERT_EXPLAIN: { max: 10, windowMs: 60_000 },
+      // Etapa 10.
+      RATE_LIMIT_ADMIN_SECURITY_ALERT_UPDATE: { max: 30, windowMs: 60_000 },
+      ALERTS_ENGINE_MAX_LATENESS_HOURS: 24,
+      ALERTS_MAX_INCIDENT_HOURS: 168,
       ALERTS_ENGINE_ENABLED: true,
       ALERTS_ENGINE_INTERVAL_SECONDS: 60,
       ALERTS_ENGINE_LAG_SECONDS: 5,
@@ -130,6 +134,29 @@ describe('loadEnv', () => {
     expect(env.SWAGGER_ENABLED).toBe(false);
     expect(env.TRUST_PROXY).toBe(1);
     expect(env.CORS_ORIGINS).toEqual(['http://a.example.com', 'http://b.example.com']);
+  });
+
+  it('Swagger: ligado por padrão fora de produção, desligado por padrão em produção', () => {
+    expect(loadEnv({ ...required, NODE_ENV: 'development' }).SWAGGER_ENABLED).toBe(true);
+    expect(loadEnv({ ...required, NODE_ENV: 'test' }).SWAGGER_ENABLED).toBe(true);
+    const production = {
+      ...required,
+      NODE_ENV: 'production' as const,
+      PASSWORD_RESET_URL: 'https://app.example.com/reset-password',
+    };
+    expect(loadEnv(production).SWAGGER_ENABLED).toBe(false);
+    // Habilitar em produção continua possível, mas só de forma explícita.
+    expect(loadEnv({ ...production, SWAGGER_ENABLED: 'true' }).SWAGGER_ENABLED).toBe(true);
+  });
+
+  it('ALERTS_MAX_INCIDENT_HOURS precisa ser pelo menos o dobro da janela de deduplicação', () => {
+    expect(() =>
+      loadEnv({ ...required, ALERTS_DEDUP_WINDOW_HOURS: '24', ALERTS_MAX_INCIDENT_HOURS: '47' }),
+    ).toThrow(/ALERTS_MAX_INCIDENT_HOURS/);
+    expect(
+      loadEnv({ ...required, ALERTS_DEDUP_WINDOW_HOURS: '24', ALERTS_MAX_INCIDENT_HOURS: '48' })
+        .ALERTS_MAX_INCIDENT_HOURS,
+    ).toBe(48);
   });
 
   it('rejeita valores inválidos listando todas as variáveis com problema', () => {

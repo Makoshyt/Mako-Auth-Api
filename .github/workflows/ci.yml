@@ -1,0 +1,150 @@
+# Integração contínua do AuthAPI Pro.
+#
+# Tudo aqui usa valores FICTÍCIOS: o PostgreSQL e o Redis são serviços efêmeros do próprio job
+# e os segredos de JWT/HMAC são os de teste definidos em tests/helpers/test-env.ts. Nenhum
+# segredo do repositório é necessário. O Ollama não é usado: os testes da IA usam dublês.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+# Menor privilégio: o workflow só lê o código.
+permissions:
+  contents: read
+
+# Um push novo na mesma branch cancela a execução anterior.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Alguns comandos do Prisma leem DATABASE_URL via prisma.config.ts mesmo sem acessar o banco.
+  DATABASE_URL: postgresql://authapi:authapi_ci_password@localhost:5432/authapi_test
+  NODE_ENV: test
+  # Desliga telemetria/avisos interativos de ferramentas em CI.
+  CI: 'true'
+
+jobs:
+  quality:
+    name: Lint, tipos, formatação, build e testes unitários
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Instalar dependências (lockfile exato)
+        run: npm ci
+
+      - name: Gerar o Prisma Client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Formatação
+        run: npm run format:check
+
+      - name: Build
+        run: npm run build
+
+      - name: Testes unitários
+        run: npm run test:unit
+
+  integration:
+    name: Testes de integração (PostgreSQL + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        # Mesma imagem do docker-compose.yml.
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: authapi
+          POSTGRES_PASSWORD: authapi_ci_password
+          POSTGRES_DB: authapi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authapi -d authapi_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:8.10.3-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL_TEST: postgresql://authapi:authapi_ci_password@localhost:5432/authapi_test
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Instalar dependências (lockfile exato)
+        run: npm ci
+
+      - name: Gerar o Prisma Client
+        run: npx prisma generate
+
+      - name: Aplicar migrations no banco de testes
+        # migrate deploy só aplica migrations pendentes; nunca apaga dados nem recria o banco.
+        run: npx prisma migrate deploy
+
+      - name: Verificar que o schema e as migrations estão em sincronia
+        run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      - name: Testes de integração
+        run: npm run test:integration
+
+  dependencies:
+    name: Auditoria de dependências
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Política (docs/architecture.md, "Dependências"):
+      #  - high/critical em qualquer dependência: BLOQUEIA o merge;
+      #  - moderate/low: relatório no resumo do job, triado manualmente (sem `audit fix --force`).
+      - name: npm audit (bloqueia high e critical)
+        run: npm audit --audit-level=high
+
+      - name: Relatório completo (não bloqueia)
+        if: always()
+        run: |
+          {
+            echo '### npm audit'
+            echo '```'
+            npm audit || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verificar assinaturas do registro npm
+        run: npm audit signatures

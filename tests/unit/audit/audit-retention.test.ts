@@ -48,7 +48,14 @@ describe('critério de vencimento', () => {
       ],
     });
     expect(EXTENDED_RETENTION_TYPES).toEqual(
-      expect.arrayContaining(['TOKEN_REUSE_DETECTED', 'ACCESS_DENIED', 'ADMIN_AUDIT_QUERIED']),
+      expect.arrayContaining([
+        'TOKEN_REUSE_DETECTED',
+        'ACCESS_DENIED',
+        'ADMIN_AUDIT_QUERIED',
+        // Etapa 10: quem consultou e quem resolveu alertas (responsabilização).
+        'ADMIN_SECURITY_ALERTS_QUERIED',
+        'ADMIN_SECURITY_ALERT_UPDATED',
+      ]),
     );
     expect(EXTENDED_RETENTION_TYPES).not.toContain('LOGIN_SUCCESS');
   });

@@ -354,6 +354,7 @@ describe('modo de falha de cada política', () => {
       adminSecurityAlerts: 'open',
       adminSecurityAlertById: 'open',
       adminSecurityAlertExplain: 'closed',
+      adminSecurityAlertUpdate: 'closed',
       logout: 'open',
       logoutAll: 'open',
       adminUsers: 'open',
