@@ -36,6 +36,9 @@ export const RELAXED_RATE_LIMITS: Record<string, string> = Object.fromEntries(
     'FORGOT_PASSWORD_IP',
     'FORGOT_PASSWORD_ACCOUNT',
     'RESET_PASSWORD_IP',
+    'ADMIN_SECURITY_ALERTS',
+    'ADMIN_SECURITY_ALERT_BY_ID',
+    'ADMIN_SECURITY_ALERT_EXPLAIN',
   ].map((name) => [`RATE_LIMIT_${name}`, '100000/1h']),
 );
 
@@ -64,6 +67,8 @@ export function testEnv(
     RATE_LIMIT_KEY_PREFIX: `${TEST_RATE_LIMIT_ROOT}:${randomUUID()}`,
     // https fictício: válido também nos testes que sobem o app com NODE_ENV=production.
     PASSWORD_RESET_URL: 'https://app.example.com/reset-password',
+    // Sem rodadas periódicas em segundo plano: os testes chamam runDetection explicitamente.
+    ALERTS_ENGINE_ENABLED: 'false',
     ...(rateLimits === 'relaxed' && RELAXED_RATE_LIMITS),
     ...overrides,
   });

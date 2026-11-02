@@ -200,9 +200,15 @@ describe('rotas de perfil exigem autenticação (ativadas na Etapa 4)', () => {
 
     const paths = Object.keys(spec.paths);
     expect(paths.filter((path) => path.startsWith('/api/v1/users'))).toEqual(['/api/v1/users/me']);
-    // A única rota com id de usuário é administrativa e exige Bearer (o RBAC é testado em admin.test).
-    expect(paths.filter((path) => path.includes('{id}'))).toEqual(['/api/v1/admin/users/{id}']);
-    expect(spec.paths['/api/v1/admin/users/{id}']?.get?.security).toEqual([{ bearerAuth: [] }]);
+    // Toda rota que recebe id é administrativa e exige Bearer (o RBAC é testado em admin.test).
+    const withId = paths.filter((path) => path.includes('{id}'));
+    expect(withId).toContain('/api/v1/admin/users/{id}');
+    for (const path of withId) {
+      expect(path.startsWith('/api/v1/admin/')).toBe(true);
+      for (const operation of Object.values(spec.paths[path] ?? {})) {
+        expect(operation.security).toEqual([{ bearerAuth: [] }]);
+      }
+    }
     expect(spec.paths['/api/v1/users/me']?.get?.security).toEqual([{ bearerAuth: [] }]);
     expect(spec.paths['/api/v1/users/me']?.patch?.security).toEqual([{ bearerAuth: [] }]);
   });

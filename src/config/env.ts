@@ -144,6 +144,41 @@ export const envSchema = z
     MAIL_PROVIDER: z.enum(['log', 'dev-mailbox']).default('log'),
     MAIL_FROM: z.string().min(3).max(200).default('AuthAPI Pro <no-reply@authapi.localhost>'),
     DEV_MAILBOX_DIR: z.string().min(1).default('.dev-mailbox'),
+    RATE_LIMIT_ADMIN_SECURITY_ALERTS: rateLimitSpec('60/1m'),
+    RATE_LIMIT_ADMIN_SECURITY_ALERT_BY_ID: rateLimitSpec('60/1m'),
+    RATE_LIMIT_ADMIN_SECURITY_ALERT_EXPLAIN: rateLimitSpec('10/1m'),
+    // --- Motor de alertas (Etapa 9) ---
+    /** Liga a avaliação periódica dentro da API. Também há o comando `npm run alerts:process`. */
+    ALERTS_ENGINE_ENABLED: z.stringbool().default(true),
+    ALERTS_ENGINE_INTERVAL_SECONDS: z.coerce.number().int().min(10).max(3600).default(60),
+    /** Eventos mais novos que isto esperam a próxima rodada (dá tempo de os INSERTs confirmarem). */
+    ALERTS_ENGINE_LAG_SECONDS: z.coerce.number().int().min(0).max(300).default(5),
+    /** Na primeira execução (sem checkpoint), quanto da trilha avaliar para trás. */
+    ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+    /** Um incidente com a mesma regra e alvo vira um único alerta dentro desta janela. */
+    ALERTS_DEDUP_WINDOW_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+    // Regras no formato "<limite>/<janela>": dispara quando a contagem na janela atinge o limite.
+    ALERT_BRUTE_FORCE_ACCOUNT: rateLimitSpec('8/1h'),
+    ALERT_CREDENTIAL_STUFFING: rateLimitSpec('5/1h'),
+    ALERT_TOKEN_REUSE: rateLimitSpec('1/24h'),
+    ALERT_RATE_LIMIT_ABUSE: rateLimitSpec('3/1h'),
+    ALERT_ADMIN_ACCESS_PROBING: rateLimitSpec('5/1h'),
+    ALERT_PASSWORD_RESET_ABUSE: rateLimitSpec('5/1h'),
+    // --- IA local opcional (explica alertas; nunca detecta nem decide) ---
+    ALERTS_AI_ENABLED: z.stringbool().default(false),
+    /** Só endereços locais: as evidências nunca saem da máquina. */
+    OLLAMA_URL: z
+      .url({ protocol: /^https?$/ })
+      .default('http://127.0.0.1:11434')
+      .refine(
+        (value) => ['localhost', '127.0.0.1', '[::1]'].includes(new URL(value).hostname),
+        'precisa ser local (localhost, 127.0.0.1 ou ::1): evidências não podem sair da máquina',
+      ),
+    OLLAMA_MODEL: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9._:-]{0,63}$/i, 'nome de modelo inválido')
+      .default('qwen2.5:7b'),
+    OLLAMA_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
   })
   .superRefine((env, ctx) => {
     if (env.NODE_ENV === 'production' && env.CORS_ORIGINS.includes('*')) {

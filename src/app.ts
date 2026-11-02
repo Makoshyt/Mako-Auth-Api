@@ -15,6 +15,15 @@ import type { Redis } from './infra/redis.js';
 import { createAdminRepository } from './modules/admin/admin.repository.js';
 import { adminRoutes } from './modules/admin/admin.routes.js';
 import { createAdminService } from './modules/admin/admin.service.js';
+import {
+  createOllamaExplainer,
+  disabledExplainer,
+  type AlertExplainer,
+} from './modules/alerts/alert-explainer.js';
+import { buildDetectionRules } from './modules/alerts/alert-rules.js';
+import { createAlertsRepository } from './modules/alerts/alerts.repository.js';
+import { createAlertsService } from './modules/alerts/alerts.service.js';
+import { createEngineScheduler, runDetection } from './modules/alerts/detection-engine.js';
 import { createAuditRecorder } from './modules/audit/audit.recorder.js';
 import { registerAuthentication } from './modules/auth/auth.middleware.js';
 import { createAuthRepository } from './modules/auth/auth.repository.js';
@@ -55,6 +64,8 @@ export interface AppDependencies {
   logDestination?: DestinationStream;
   /** Provedor de email. Padrão: o escolhido por MAIL_PROVIDER. Os testes injetam o MemoryMailer. */
   mailer?: Mailer;
+  /** Explicador de alertas. Padrão: Ollama local se ALERTS_AI_ENABLED, senão desligado. */
+  alertExplainer?: AlertExplainer;
 }
 
 declare module 'fastify' {
@@ -75,6 +86,7 @@ export async function buildApp({
   redis,
   logDestination,
   mailer: injectedMailer,
+  alertExplainer,
 }: AppDependencies): Promise<FastifyInstance> {
   const app = Fastify({
     logger: buildLoggerOptions(env, logDestination),
@@ -148,6 +160,53 @@ export async function buildApp({
   if (env.NODE_ENV === 'production' && mailer.name === 'log') {
     app.log.warn('MAIL_PROVIDER=log em produção: emails de recuperação NÃO serão entregues');
   }
+  const alertsService = createAlertsService({
+    repository: createAlertsRepository(prisma),
+    explainer:
+      alertExplainer ??
+      (env.ALERTS_AI_ENABLED
+        ? createOllamaExplainer({
+            baseUrl: env.OLLAMA_URL,
+            model: env.OLLAMA_MODEL,
+            timeoutMs: env.OLLAMA_TIMEOUT_MS,
+          })
+        : disabledExplainer),
+    audit,
+  });
+
+  // Motor de alertas: rodadas periódicas FORA do caminho das requisições, a partir do checkpoint
+  // persistido. Começa quando o servidor fica pronto e para (esperando a rodada atual) ao fechar.
+  if (env.ALERTS_ENGINE_ENABLED) {
+    const scheduler = createEngineScheduler(
+      () =>
+        runDetection(prisma, {
+          rules: buildDetectionRules(env),
+          lagMs: env.ALERTS_ENGINE_LAG_SECONDS * 1000,
+          initialLookbackMs: env.ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS * 3_600_000,
+          dedupWindowMs: env.ALERTS_DEDUP_WINDOW_HOURS * 3_600_000,
+        }),
+      env.ALERTS_ENGINE_INTERVAL_SECONDS * 1000,
+      (result) => {
+        if (result.created > 0 || result.updated > 0 || result.behind) {
+          app.log.info(
+            { created: result.created, updated: result.updated, behind: result.behind },
+            'motor de alertas: rodada concluída',
+          );
+        }
+      },
+      (error) => {
+        app.log.error(
+          { reason: error instanceof Error ? error.message : 'erro desconhecido' },
+          'motor de alertas: rodada falhou; será repetida a partir do checkpoint',
+        );
+      },
+    );
+    app.addHook('onReady', async () => {
+      scheduler.start();
+    });
+    app.addHook('onClose', () => scheduler.stop());
+  }
+
   const passwordResetService = createPasswordResetService({
     repository: createPasswordResetRepository(prisma),
     hashPassword,
@@ -179,7 +238,7 @@ export async function buildApp({
     });
     await api.register(usersRoutes, { prefix: '/api/v1', usersService });
     await api.register(authRoutes, { prefix: '/api/v1', authService });
-    await api.register(adminRoutes, { prefix: '/api/v1/admin', adminService });
+    await api.register(adminRoutes, { prefix: '/api/v1/admin', adminService, alertsService });
     await api.register(passwordResetRoutes, { prefix: '/api/v1', passwordResetService });
   });
 

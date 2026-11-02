@@ -56,6 +56,25 @@ describe('loadEnv', () => {
       MAIL_PROVIDER: 'log',
       MAIL_FROM: 'AuthAPI Pro <no-reply@authapi.localhost>',
       DEV_MAILBOX_DIR: '.dev-mailbox',
+      // Defaults da Etapa 9.
+      RATE_LIMIT_ADMIN_SECURITY_ALERTS: { max: 60, windowMs: 60_000 },
+      RATE_LIMIT_ADMIN_SECURITY_ALERT_BY_ID: { max: 60, windowMs: 60_000 },
+      RATE_LIMIT_ADMIN_SECURITY_ALERT_EXPLAIN: { max: 10, windowMs: 60_000 },
+      ALERTS_ENGINE_ENABLED: true,
+      ALERTS_ENGINE_INTERVAL_SECONDS: 60,
+      ALERTS_ENGINE_LAG_SECONDS: 5,
+      ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS: 24,
+      ALERTS_DEDUP_WINDOW_HOURS: 24,
+      ALERT_BRUTE_FORCE_ACCOUNT: { max: 8, windowMs: 3_600_000 },
+      ALERT_CREDENTIAL_STUFFING: { max: 5, windowMs: 3_600_000 },
+      ALERT_TOKEN_REUSE: { max: 1, windowMs: 86_400_000 },
+      ALERT_RATE_LIMIT_ABUSE: { max: 3, windowMs: 3_600_000 },
+      ALERT_ADMIN_ACCESS_PROBING: { max: 5, windowMs: 3_600_000 },
+      ALERT_PASSWORD_RESET_ABUSE: { max: 5, windowMs: 3_600_000 },
+      ALERTS_AI_ENABLED: false,
+      OLLAMA_URL: 'http://127.0.0.1:11434',
+      OLLAMA_MODEL: 'qwen2.5:7b',
+      OLLAMA_TIMEOUT_MS: 20_000,
       ...required,
     });
   });
@@ -262,6 +281,53 @@ describe('loadEnv', () => {
 
     it.each(['smtp', 'ses', 'memory'])('recusa MAIL_PROVIDER desconhecido: %s', (value) => {
       expect(() => loadEnv({ ...required, MAIL_PROVIDER: value })).toThrow(/MAIL_PROVIDER/);
+    });
+  });
+
+  describe('motor de alertas e IA local', () => {
+    it.each([
+      'http://192.168.0.10:11434',
+      'https://api.ollama.example.com',
+      'http://ollama.internal:11434',
+      'http://10.0.0.5:11434',
+    ])('recusa OLLAMA_URL fora da máquina (%s): evidências não podem sair', (value) => {
+      const error = captureError(() => loadEnv({ ...required, OLLAMA_URL: value }));
+      expect(error.issues).toEqual([expect.stringMatching(/^OLLAMA_URL: .*local/)]);
+    });
+
+    it.each(['http://localhost:11434', 'http://127.0.0.1:8080', 'http://[::1]:11434'])(
+      'aceita OLLAMA_URL local: %s',
+      (value) => {
+        expect(loadEnv({ ...required, OLLAMA_URL: value }).OLLAMA_URL).toBe(value);
+      },
+    );
+
+    it.each(['qwen 2.5', 'modelo;rm -rf', '../modelo'])(
+      'recusa OLLAMA_MODEL inválido: %s',
+      (value) => {
+        expect(() => loadEnv({ ...required, OLLAMA_MODEL: value })).toThrow(/OLLAMA_MODEL/);
+      },
+    );
+
+    it('regras no formato <limite>/<janela>; janela até 24 h', () => {
+      expect(
+        loadEnv({ ...required, ALERT_BRUTE_FORCE_ACCOUNT: '20/30m' }).ALERT_BRUTE_FORCE_ACCOUNT,
+      ).toEqual({
+        max: 20,
+        windowMs: 1_800_000,
+      });
+      expect(() => loadEnv({ ...required, ALERT_TOKEN_REUSE: '1/48h' })).toThrow(
+        /ALERT_TOKEN_REUSE/,
+      );
+    });
+
+    it.each([
+      ['ALERTS_ENGINE_INTERVAL_SECONDS', '5'],
+      ['ALERTS_ENGINE_LAG_SECONDS', '-1'],
+      ['OLLAMA_TIMEOUT_MS', '500'],
+      ['ALERTS_AI_ENABLED', 'talvez'],
+    ])('recusa %s=%s', (name, value) => {
+      expect(() => loadEnv({ ...required, [name]: value })).toThrow(new RegExp(name));
     });
   });
 });

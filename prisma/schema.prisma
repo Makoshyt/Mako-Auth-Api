@@ -2,9 +2,9 @@
 // Restrições CHECK, que o Prisma não expressa, foram adicionadas ao SQL da migration init.
 
 generator client {
-  provider     = "prisma-client"
-  output       = "../src/generated/prisma"
-  moduleFormat = "esm"
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  moduleFormat    = "esm"
   // Permite declarar no schema o índice único parcial de security_alerts.
   previewFeatures = ["partialIndexes"]
 }
@@ -41,12 +41,16 @@ enum AuditEventType {
   ADMIN_USERS_LISTED // ADMIN consultou a listagem de usuários
   ADMIN_USER_VIEWED // ADMIN consultou um usuário pelo id
   ADMIN_AUDIT_QUERIED // ADMIN consultou a trilha de auditoria (um evento por consulta)
+  ADMIN_SECURITY_ALERTS_QUERIED // ADMIN listou/consultou/pediu explicação de alertas
 }
 
 enum AlertRule {
   BRUTE_FORCE_ACCOUNT // muitas falhas de login para o mesmo email
   CREDENTIAL_STUFFING // um IP falhando em muitos emails diferentes
   TOKEN_REUSE // refresh token reutilizado fora da janela de tolerância
+  RATE_LIMIT_ABUSE // um IP bloqueado pelo rate limit repetidas vezes
+  ADMIN_ACCESS_PROBING // um usuário recebendo 403 em rotas admin repetidas vezes
+  PASSWORD_RESET_ABUSE // um IP pedindo recuperação de senha em excesso
 }
 
 enum AlertSeverity {
@@ -177,8 +181,18 @@ model SecurityAlert {
 
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
-  @@index([status, createdAt])
   // No máximo um alerta OPEN por incidente: deduplicação segura contra concorrência.
   @@unique([fingerprint], map: "security_alerts_open_fingerprint_key", where: raw("status = 'OPEN'"))
+  @@index([status, createdAt])
   @@map("security_alerts")
+}
+
+/// Progresso do motor de alertas: até onde (created_at) a trilha de auditoria já foi avaliada.
+/// Persistido para que um reinício continue de onde parou, sem perder nem repetir eventos.
+model DetectionCheckpoint {
+  name           String   @id @db.VarChar(64)
+  processedUntil DateTime @map("processed_until") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("detection_checkpoints")
 }

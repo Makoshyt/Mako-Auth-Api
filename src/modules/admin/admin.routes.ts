@@ -13,9 +13,20 @@ import {
   userListSchema,
 } from './admin.schemas.js';
 import type { AdminActor, AdminService } from './admin.service.js';
+import {
+  alertIdParamsSchema,
+  explanationResponseSchema,
+  listAlertsQuerySchema,
+  securityAlertListSchema,
+  securityAlertSchema,
+  toAlertDto,
+  toExplanationDto,
+} from '../alerts/alerts.schemas.js';
+import type { AlertsService } from '../alerts/alerts.service.js';
 
 interface AdminRoutesOptions {
   adminService: AdminService;
+  alertsService: AlertsService;
 }
 
 /** O ADMIN da requisição, derivado do token e do IP da conexão. */
@@ -39,7 +50,7 @@ const protectedResponses = {
  * recebe 403, sem descobrir nada sobre os parâmetros aceitos.
  */
 export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app, options) => {
-  const { adminService } = options;
+  const { adminService, alertsService } = options;
 
   // Toda rota admin PRECISA declarar `config.rateLimit`: sem isso, o servidor nem sobe.
   app.addHook('onRoute', (route) => {
@@ -115,5 +126,77 @@ export const adminRoutes: FastifyPluginAsyncZod<AdminRoutesOptions> = async (app
       const page = await adminService.listAuditEvents(request.query, actorOf(request));
       return toAuditEventListDto(page, request.query);
     },
+  );
+
+  app.get(
+    '/security-alerts',
+    {
+      config: { rateLimit: 'adminSecurityAlerts' },
+      schema: {
+        tags: ['Admin'],
+        summary: 'Lista alertas de segurança (paginado)',
+        description:
+          'Filtros: rule, severity, status. Ordenação estável por createdAt e id. ' +
+          'pageSize máximo de 100. Somente leitura: não há exclusão nem ações automáticas.',
+        security: bearerAuth,
+        querystring: listAlertsQuerySchema,
+        response: { 200: securityAlertListSchema, ...protectedResponses },
+      },
+    },
+    async (request) => {
+      const { items, total } = await alertsService.list(request.query, actorOf(request));
+      return {
+        data: items.map(toAlertDto),
+        pagination: {
+          page: request.query.page,
+          pageSize: request.query.pageSize,
+          total,
+          totalPages: Math.ceil(total / request.query.pageSize),
+        },
+      };
+    },
+  );
+
+  app.get(
+    '/security-alerts/:id',
+    {
+      config: { rateLimit: 'adminSecurityAlertById' },
+      schema: {
+        tags: ['Admin'],
+        summary: 'Consulta um alerta de segurança',
+        security: bearerAuth,
+        params: alertIdParamsSchema,
+        response: {
+          200: securityAlertSchema,
+          ...protectedResponses,
+          404: errorResponseSchema.describe('Alerta não encontrado'),
+        },
+      },
+    },
+    async (request) => toAlertDto(await alertsService.get(request.params.id, actorOf(request))),
+  );
+
+  app.post(
+    '/security-alerts/:id/explanation',
+    {
+      config: { rateLimit: 'adminSecurityAlertExplain' },
+      schema: {
+        tags: ['Admin'],
+        summary: 'Explicação do alerta por IA local (opcional)',
+        description:
+          'Gera, sob demanda, uma explicação em texto com um modelo LOCAL (Ollama). Desligada ' +
+          'por padrão (status "disabled"). Não é gravada, não altera o alerta e não executa ' +
+          'nenhuma ação: é apoio à análise humana. Recebe só evidências minimizadas.',
+        security: bearerAuth,
+        params: alertIdParamsSchema,
+        response: {
+          200: explanationResponseSchema,
+          ...protectedResponses,
+          404: errorResponseSchema.describe('Alerta não encontrado'),
+        },
+      },
+    },
+    async (request) =>
+      toExplanationDto(await alertsService.explain(request.params.id, actorOf(request))),
   );
 };

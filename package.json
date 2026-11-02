@@ -32,6 +32,7 @@
     "db:seed": "prisma db seed",
     "admin:promote": "tsx scripts/promote-admin.ts",
     "audit:retention": "tsx scripts/audit-retention.ts",
+    "alerts:process": "tsx scripts/alerts-process.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {

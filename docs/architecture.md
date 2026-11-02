@@ -1,6 +1,6 @@
 # Arquitetura e decisões técnicas
 
-> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 8 (auditoria avançada)**.
+> Documento vivo: cada etapa acrescenta suas decisões. Status atual: **Etapa 9 (motor de alertas de segurança)**.
 
 ## Visão geral
 
@@ -1077,4 +1077,209 @@ não foi implementada.
   do `last_used_at`.
 - **IP é dado pessoal** visível ao ADMIN. A política de retenção e a base legal precisam ser
   validadas juridicamente.
-- O motor de alertas que consome estes eventos é a Etapa 9.
+- ~~O motor de alertas que consome estes eventos é a Etapa 9~~: implementado (ver adiante).
+
+## Etapa 9: motor de alertas de segurança
+
+### O que foi reaproveitado
+
+- A tabela `security_alerts` da Etapa 2, com índice único **parcial** em `fingerprint`
+  (`WHERE status = 'OPEN'`), CHECKs de consistência e `ON DELETE SET NULL`.
+- As regras `BRUTE_FORCE_ACCOUNT`, `CREDENTIAL_STUFFING` e `TOKEN_REUSE`, já no enum `AlertRule`.
+- Os índices de `audit_events` em `(type, created_at)`, `(email_hash, created_at)` e
+  `(ip, created_at)`, criados na Etapa 2 pensando nestas regras.
+- O formato `<limite>/<janela>` do rate limit (Etapa 6), o `AuditRecorder`, o plugin admin
+  (`authenticate`, rate limit e `requireRole`) e os hooks de ciclo de vida do Fastify.
+
+A migration `20261102090000_security_alerts_engine` é aditiva:
+
+- 3 regras novas: `RATE_LIMIT_ABUSE`, `ADMIN_ACCESS_PROBING` e `PASSWORD_RESET_ABUSE`;
+- 1 tipo de evento novo: `ADMIN_SECURITY_ALERTS_QUERIED`;
+- a tabela `detection_checkpoints`.
+
+### Estrutura
+
+```
+src/modules/alerts/
+  alert-rules.ts          # regras como dados (evento, agrupamento, métrica, limite, janela, severidade)
+  detection.repository.ts # SQL: janela deslizante exata, upsert deduplicado, advisory lock, checkpoint
+  detection-engine.ts     # runDetection (rodada transacional) + agendador periódico
+  alert-explainer.ts      # IA opcional: interface, Ollama local, validação da saída
+  alerts.repository.ts    # consultas administrativas (sem fingerprint)
+  alerts.service.ts       # list/get/explain + auditoria + minimização para a IA
+  alerts.schemas.ts       # Zod: filtros, paginação, DTOs
+scripts/alerts-process.ts # rodada manual (npm run alerts:process)
+```
+
+### Arquitetura do processamento
+
+Avaliei três opções:
+
+- **Detecção no caminho da requisição:** bloquearia o HTTP e acoplaria cada rota ao motor.
+- **Tarefa em memória após cada evento:** perde trabalho se o processo cair.
+- **Rodadas periódicas a partir de um checkpoint persistido** (escolhida).
+
+```mermaid
+flowchart TD
+  T[Agendador na API<br/>a cada 60 s · onReady/onClose] --> R
+  C[npm run alerts:process<br/>cron/manual] --> R
+  R[runDetection] --> TX{{"Transação"}}
+  TX --> L{pg_try_advisory_xact_lock}
+  L -- outra instância --> SKIP[nada a fazer]
+  L -- travou --> CK["from = checkpoint<br/>to = now() do banco - lag (máx. 6 h por iteração)"]
+  CK --> Q["Para cada regra: janela deslizante EXATA em SQL<br/>count() OVER (PARTITION BY alvo ORDER BY created_at<br/>RANGE janela PRECEDING) sobre (from - janela, to]"]
+  Q --> U["Continua o alerta OPEN do mesmo alvo com atividade na janela de dedup<br/>senão INSERT … ON CONFLICT (fingerprint) WHERE status='OPEN'<br/>soma event_count, severidade só sobe"]
+  U --> W[checkpoint = to]
+  W --> COMMIT[COMMIT: alertas + checkpoint juntos]
+  COMMIT -- ainda atrasado --> TX
+```
+
+| Propriedade                     | Como é garantida                                                                                                                                                                                                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Não bloqueia requisições        | O motor roda em rodadas próprias (agendador com `unref`, sem sobreposição) ou no CLI. Nenhuma rota espera por ele                                                                                                                         |
+| Não perde eventos após reinício | O progresso fica em `detection_checkpoints`. Uma rodada nova, sem nenhum estado em memória, continua do checkpoint (testado)                                                                                                              |
+| Não conta duas vezes            | Alertas e checkpoint são gravados na **mesma transação**. Se algo falhar, nada do intervalo é confirmado e o mesmo intervalo é reprocessado (testado com uma regra que quebra no meio). Só eventos de `(from, to]` somam em `event_count` |
+| Um processador por vez          | `pg_try_advisory_xact_lock`: duas instâncias (ou API + CLI) nunca avaliam o mesmo intervalo. Teste de mutação: remover a trava fez o teste de concorrência falhar nas 3 execuções                                                         |
+| Sem alertas duplicados          | Índice único parcial + `ON CONFLICT … DO UPDATE`. 5 gravações simultâneas do mesmo incidente resultam em 1 alerta com `eventCount` 5 (testado)                                                                                            |
+| Resultado igual em pedaços      | A janela olha `windowMs` para trás de cada evento, inclusive antes de `from`. Retomar uma parada longa em vários intervalos dá o mesmo resultado (testado com `maxRangeMs`)                                                               |
+| Sem alerta de alerta            | Cada regra lê **um** tipo de evento de segurança. O motor nunca lê `ADMIN_*` nem `security_alerts` e nunca grava em `audit_events` (testado)                                                                                              |
+| Não derruba o processo          | Erros da rodada vão para o log, sem identificadores. A próxima rodada repete a partir do checkpoint                                                                                                                                       |
+
+### Política de severidade
+
+| Regra                  | Ao atingir o limite | Ao atingir o dobro | Motivo                                                       |
+| ---------------------- | ------------------- | ------------------ | ------------------------------------------------------------ |
+| `TOKEN_REUSE`          | HIGH                | HIGH               | Indica token roubado (a sessão já foi revogada pela Etapa 4) |
+| `CREDENTIAL_STUFFING`  | HIGH                | HIGH               | Ataque ativo contra várias contas                            |
+| `BRUTE_FORCE_ACCOUNT`  | MEDIUM              | HIGH               | Pode ser ataque ou usuário que esqueceu a senha              |
+| `ADMIN_ACCESS_PROBING` | MEDIUM              | HIGH               | Sondagem de privilégio por conta autenticada                 |
+| `RATE_LIMIT_ABUSE`     | LOW                 | MEDIUM             | Abuso já contido pelo rate limit                             |
+| `PASSWORD_RESET_ABUSE` | LOW                 | MEDIUM             | Já limitado a 5/h por IP; pode ser usuário insistente        |
+
+A severidade é recalculada a cada atualização com `GREATEST` sobre o enum
+(`LOW < MEDIUM < HIGH`), então **nunca é rebaixada**.
+
+### Deduplicação
+
+A deduplicação é **deslizante** sobre a janela `ALERTS_DEDUP_WINDOW_HOURS` (24 h):
+
+1. **Continuação.** Antes de criar, o motor procura o alerta `OPEN` mais recente da mesma regra
+   e do mesmo alvo (`starts_with(fingerprint, '<regra>:<hash do alvo>:')`) cuja
+   `last_seen_at` esteja a no máximo uma janela do início da atividade nova. Se existir, a
+   atividade é somada a ele (`eventCount`, `lastSeenAt`, pico, severidade). Um ataque que
+   atravessa a meia-noite UTC continua sendo **um** alerta (testado, com mutação: sem a
+   continuação, o teste falha).
+2. **Alerta novo.** Senão, `INSERT` com
+   `fingerprint = <regra>:<SHA-256(regra:alvo) truncado em 32>:<período>`, em que
+   `período = floor(firstSeen / janela)`. O período só dá unicidade ao INSERT: o índice único
+   parcial + `ON CONFLICT … DO UPDATE` impedem dois alertas abertos com o mesmo fingerprint.
+
+As duas atualizações usam o mesmo trecho SQL (`mergeSet`), então somam do mesmo jeito.
+
+- O alvo entra só como hash: o fingerprint nunca carrega IP nem email, e a API não o devolve.
+- Depois de um intervalo **sem atividade** maior que a janela, a mesma atividade vira um
+  alerta novo (testado com janela de 10 minutos).
+- O índice único parcial e a continuação só valem para `OPEN`. Um alerta `RESOLVED` não
+  recebe atividade nova: ela abre outro alerta `OPEN` (testado).
+- **Concorrência:** as rodadas são serializadas pelo advisory lock, e a continuação trava a
+  linha escolhida (`FOR UPDATE`). Se dois processos ignorassem a trava e gravassem ao mesmo
+  tempo, o índice único ainda impediria duplicatas no mesmo período.
+
+### Consulta
+
+`GET /admin/security-alerts` (paginação de 1 a 100, filtros `rule`, `severity`, `status` e
+`order`, ordem estável por `createdAt`, `id`), `GET /admin/security-alerts/:id` e
+`POST /admin/security-alerts/:id/explanation`:
+
+- só ADMIN, com 401, 403 e rate limit pelos hooks do plugin admin;
+- limites: 60/min para listar e consultar, 10/min para a explicação (fail-closed, por ser mais
+  cara);
+- respostas sem `fingerprint`;
+- cada consulta gera um `ADMIN_SECURITY_ALERTS_QUERIED` (ações `LIST`, `VIEW`, `EXPLAIN`),
+  que o motor não lê.
+
+**Não há** exclusão de alertas, resolução automática nem ação contra usuários.
+
+### IA local opcional
+
+| Requisito                 | Implementação                                                                                                                                                                                        |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Desligada por padrão      | `ALERTS_AI_ENABLED=false` usa o `disabledExplainer`, que responde `status: disabled` sem chamar nada                                                                                                 |
+| Só local                  | `OLLAMA_URL` validado na inicialização: só `localhost`, `127.0.0.1` ou `::1`                                                                                                                         |
+| Não detecta nem decide    | É chamada só sob demanda, na rota de explicação. O motor não depende dela                                                                                                                            |
+| Não altera nada           | A explicação não é gravada e o explicador não recebe acesso ao banco. Testado: o alerta fica idêntico após a explicação                                                                              |
+| Evidências minimizadas    | `toEvidence`: regra, severidade, estado, resumo fixo, limite, janela, pico, contagem, duração e tipo de alvo. Sem IP, email, ids ou datas absolutas (testado no prompt e no que chega ao explicador) |
+| Saída validada e limitada | `format: "json"` + Zod: resumo ≤ 600, até 5 itens ≤ 240 por lista. Remove caracteres de controle. Fora disso: `INVALID_RESPONSE`                                                                     |
+| Timeout e falhas          | `AbortSignal.timeout(OLLAMA_TIMEOUT_MS)` (20 s). Fora do ar, erro HTTP, timeout ou resposta inválida viram `status: unavailable` com `reason`, sempre 200                                            |
+| Sem comandos              | A saída é texto puro numa resposta JSON. Nada da resposta é interpretado ou executado                                                                                                                |
+| Sem download automático   | A API só usa um modelo já presente. O `ollama pull` é manual                                                                                                                                         |
+
+Medido com o `qwen2.5:7b` local:
+
+- **A frio:** a primeira chamada estourou o timeout de 90 s enquanto o modelo era carregado na
+  memória (4,7 GB). A API respondeu `unavailable: TIMEOUT` corretamente.
+- **Com o modelo carregado:** 2 s pela API, com saída válida.
+
+### Falsos positivos e limitações
+
+- **`BRUTE_FORCE_ACCOUNT`:** um usuário que esqueceu a senha pode chegar a 8 falhas. Por isso a
+  severidade padrão é MEDIUM. O limite por conta do rate limit (10/h) faz o pico raramente
+  passar de 10, então HIGH é incomum com os padrões.
+- **IPs compartilhados** (NAT, CGNAT, proxies corporativos) podem gerar `CREDENTIAL_STUFFING`,
+  `RATE_LIMIT_ABUSE` ou `PASSWORD_RESET_ABUSE` com usuários legítimos.
+- **Limites próximos aos do rate limit:** `PASSWORD_RESET_ABUSE` (5/h) dispara exatamente quando
+  alguém esgota o limite de pedidos por IP.
+- **Evento atrasado:** um evento cujo `created_at` fique antes do checkpoint (INSERT confirmado
+  mais de `ALERTS_ENGINE_LAG_SECONDS` depois do seu `now()`) não é reavaliado. Os INSERTs de
+  auditoria são instantâneos e o lag de 5 s cobre a folga. Há um teste que **documenta** esse
+  comportamento.
+- **Incidente contínuo cresce indefinidamente:** com a deduplicação deslizante, uma atividade
+  que nunca para por mais de 24 h segue somando no mesmo alerta. `firstSeenAt`, `lastSeenAt`
+  e `eventCount` mostram a extensão real.
+- **Sem correlação entre regras** (ex.: stuffing seguido de login bem-sucedido) nem baseline
+  por usuário. As regras são limiares fixos.
+- **Alertas só são lidos.** Resolver um alerta (`RESOLVED`) e notificar alguém ficam para
+  depois. Hoje um alerta fica `OPEN` até uma ação manual no banco.
+- **IA:** modelos locais erram e generalizam. No teste manual, o modelo chamou "brute force" de
+  "força-tarefa" numa chamada. A saída é apoio, nunca evidência.
+
+### Riscos de privacidade
+
+- O alerta guarda o **IP** nas regras em que o IP é o alvo, e o `userId` quando existe. Os dois
+  são visíveis ao ADMIN, assim como na auditoria (Etapa 8). Email e hash de email nunca entram.
+- Os `sampleEventIds` permitem ao ADMIN chegar aos eventos completos, que seguem as regras de
+  minimização da Etapa 8.
+- A IA local não recebe dados pessoais. Mesmo assim, se `OLLAMA_URL` apontasse para um
+  servidor remoto, as evidências sairiam da máquina, e por isso a configuração recusa endereços
+  não locais.
+- Alertas não entram na retenção da Etapa 8. Uma política para `security_alerts` resolvidos
+  precisa ser definida.
+
+### Estratégia de recuperação após falhas
+
+| Falha                                       | Comportamento                                                                                                                                                        |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Processo cai no meio de uma rodada          | A transação é desfeita e o checkpoint não avança. A próxima rodada reprocessa o intervalo                                                                            |
+| Processo fica parado por horas              | Ao voltar, o motor avalia do checkpoint em diante, em intervalos de até 6 h (até 24 por rodada). `behind: true` indica que ainda falta, e a rodada seguinte continua |
+| Duas instâncias ou API + CLI ao mesmo tempo | O advisory lock deixa uma processar; a outra não faz nada                                                                                                            |
+| Banco indisponível                          | A rodada falha, o erro vai para o log e a próxima tenta de novo                                                                                                      |
+| Ollama indisponível                         | Só a explicação fica `unavailable`. Detecção e consulta seguem normais                                                                                               |
+| Primeira execução (sem checkpoint)          | Avalia as últimas `ALERTS_ENGINE_INITIAL_LOOKBACK_HOURS` (24 h)                                                                                                      |
+
+### Problema encontrado e corrigido: vazamento de dados de teste (desde a Etapa 4)
+
+Os primeiros testes do motor acusaram alertas inesperados. A causa eram **32 eventos
+`LOGIN_FAILURE`** acumulados no banco de testes, todos do mesmo email: `vera@auth-test`. No
+teste "troca de email com a senha correta" (Etapa 4), a Vera troca o email e o teste confirma
+que o login com o email **antigo** falha. Essa falha não tem `userId`, e a limpeza da suíte não
+a removia. A correção foi incluir o hash desse email na limpeza do `auth.test.ts`. O motor
+estava certo: era de fato um "brute force" contra a mesma conta.
+
+### Testes adaptados (e por quê)
+
+| Mudança                                                                 | Motivo                                                                                 | Garantia preservada                                     |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `testEnv`: `ALERTS_ENGINE_ENABLED=false`                                | Os testes chamam `runDetection` diretamente (determinismo)                             | O agendador tem teste unitário próprio                  |
+| `users.test.ts`: toda rota com `{id}` precisa ser admin e exigir Bearer | Surgiram `/admin/security-alerts/{id}`. A asserção antiga exigia uma única rota com id | Mais abrangente: vale para qualquer rota futura com id  |
+| `env.test.ts` e a tabela de modos de falha                              | Novas variáveis e 3 novas políticas de rate limit                                      | Novos testes para URL local do Ollama, regras e limites |
+| `auth.test.ts`: limpeza inclui o hash de `vera@auth-test`               | Vazamento descrito acima                                                               | Nenhuma asserção alterada                               |

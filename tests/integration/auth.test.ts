@@ -65,7 +65,13 @@ const sessionIdOf = (accessToken: string) =>
 async function cleanup() {
   await purgeAuditEvents(prisma, {
     where: {
-      OR: [{ user: { email: { endsWith: DOMAIN } } }, { emailHash: hashEmail(UNKNOWN_EMAIL) }],
+      OR: [
+        { user: { email: { endsWith: DOMAIN } } },
+        { emailHash: hashEmail(UNKNOWN_EMAIL) },
+        // Login com o email ANTIGO depois da troca (teste da Vera): a falha não tem userId,
+        // então só sai pelo hash. Sem isto, um LOGIN_FAILURE vazava a cada execução.
+        { emailHash: hashEmail(email('vera')) },
+      ],
     },
   });
   // Cascade: sessões e refresh tokens dos usuários de teste vão junto.

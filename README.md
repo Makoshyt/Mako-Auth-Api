@@ -3,7 +3,7 @@
 API REST de autenticação e gerenciamento de usuários construída com Node.js, TypeScript,
 Fastify, PostgreSQL e Prisma.
 
-> **Status:** Etapa 8 de 10 (auditoria completa e append-only, com retenção controlada; recuperação de senha, rate limiting, RBAC e JWT).
+> **Status:** Etapa 9 de 10 (motor de alertas de segurança com IA local opcional; auditoria, recuperação de senha, rate limiting, RBAC e JWT).
 > O README completo, com arquitetura, modelo de ameaças e roteiro de demonstração, chega na
 > Etapa 10. As decisões técnicas estão em [`docs/architecture.md`](docs/architecture.md).
 
@@ -47,23 +47,26 @@ localmente na 5432. As portas são publicadas apenas em `127.0.0.1`.
 
 ## Endpoints disponíveis
 
-| Método | Rota                           | Acesso   | Descrição                                                       |
-| ------ | ------------------------------ | -------- | --------------------------------------------------------------- |
-| GET    | `/health`                      | público  | Liveness do processo                                            |
-| GET    | `/ready`                       | público  | Readiness: PostgreSQL e Redis (200 ou 503)                      |
-| POST   | `/api/v1/auth/register`        | público  | Cadastro (papel USER), retorna 201                              |
-| POST   | `/api/v1/auth/login`           | público  | Cria uma sessão e devolve access token + refresh token          |
-| POST   | `/api/v1/auth/refresh`         | público* | Troca o refresh token por um par novo (rotação obrigatória)     |
-| POST   | `/api/v1/auth/logout`          | Bearer   | Encerra a sessão atual (204)                                    |
-| POST   | `/api/v1/auth/logout-all`      | Bearer   | Encerra todas as sessões do usuário (204)                       |
-| GET    | `/api/v1/users/me`             | Bearer   | Perfil do usuário autenticado                                   |
-| PATCH  | `/api/v1/users/me`             | Bearer   | Altera nome e/ou email (o email exige `currentPassword`)        |
-| GET    | `/api/v1/admin/users`          | ADMIN    | Lista usuários: paginação, filtros e ordenação controlada       |
-| GET    | `/api/v1/admin/users/:id`      | ADMIN    | Consulta um usuário (404 se não existir)                        |
-| GET    | `/api/v1/admin/audit-events`   | ADMIN    | Trilha de auditoria: filtros por tipo, usuário e período        |
-| POST   | `/api/v1/auth/forgot-password` | público  | Pede o link de recuperação (sempre 202, exista ou não a conta)  |
-| POST   | `/api/v1/auth/reset-password`  | público  | Redefine a senha com o token do link e encerra todas as sessões |
-| GET    | `/docs`                        | público  | Swagger UI (desligável com `SWAGGER_ENABLED`)                   |
+| Método | Rota                                            | Acesso   | Descrição                                                                |
+| ------ | ----------------------------------------------- | -------- | ------------------------------------------------------------------------ |
+| GET    | `/health`                                       | público  | Liveness do processo                                                     |
+| GET    | `/ready`                                        | público  | Readiness: PostgreSQL e Redis (200 ou 503)                               |
+| POST   | `/api/v1/auth/register`                         | público  | Cadastro (papel USER), retorna 201                                       |
+| POST   | `/api/v1/auth/login`                            | público  | Cria uma sessão e devolve access token + refresh token                   |
+| POST   | `/api/v1/auth/refresh`                          | público* | Troca o refresh token por um par novo (rotação obrigatória)              |
+| POST   | `/api/v1/auth/logout`                           | Bearer   | Encerra a sessão atual (204)                                             |
+| POST   | `/api/v1/auth/logout-all`                       | Bearer   | Encerra todas as sessões do usuário (204)                                |
+| GET    | `/api/v1/users/me`                              | Bearer   | Perfil do usuário autenticado                                            |
+| PATCH  | `/api/v1/users/me`                              | Bearer   | Altera nome e/ou email (o email exige `currentPassword`)                 |
+| GET    | `/api/v1/admin/users`                           | ADMIN    | Lista usuários: paginação, filtros e ordenação controlada                |
+| GET    | `/api/v1/admin/users/:id`                       | ADMIN    | Consulta um usuário (404 se não existir)                                 |
+| GET    | `/api/v1/admin/audit-events`                    | ADMIN    | Trilha de auditoria: filtros por tipo, usuário e período                 |
+| GET    | `/api/v1/admin/security-alerts`                 | ADMIN    | Alertas de segurança: paginação e filtros por regra, severidade e estado |
+| GET    | `/api/v1/admin/security-alerts/:id`             | ADMIN    | Consulta um alerta (404 se não existir)                                  |
+| POST   | `/api/v1/admin/security-alerts/:id/explanation` | ADMIN    | Explicação por IA local (opcional; desligada por padrão)                 |
+| POST   | `/api/v1/auth/forgot-password`                  | público  | Pede o link de recuperação (sempre 202, exista ou não a conta)           |
+| POST   | `/api/v1/auth/reset-password`                   | público  | Redefine a senha com o token do link e encerra todas as sessões          |
+| GET    | `/docs`                                         | público  | Swagger UI (desligável com `SWAGGER_ENABLED`)                            |
 
 \* Não exige o access token: a credencial é o próprio refresh token, enviado no corpo.
 
@@ -315,6 +318,78 @@ Fora de produção, a exclusão só roda em bancos `*_test`: o banco de desenvol
 apagado. Detalhes, limitações e riscos em
 [`docs/architecture.md`](docs/architecture.md#etapa-8-auditoria-avançada).
 
+### Alertas de segurança
+
+Um **motor de regras determinísticas** lê a trilha de auditoria e gera alertas persistidos em
+`security_alerts`. Ele roda **fora das requisições**: em rodadas periódicas (a cada 60 s) e a
+partir de um checkpoint salvo no PostgreSQL, que permite retomar de onde parou após um
+reinício. Não bloqueia contas nem age sobre usuários.
+
+| Regra                  | Dispara quando (padrão)                                 | Evento lido              | Severidade             |
+| ---------------------- | ------------------------------------------------------- | ------------------------ | ---------------------- |
+| `BRUTE_FORCE_ACCOUNT`  | ≥ 8 falhas de login para a mesma conta em 1 h           | `LOGIN_FAILURE`          | MEDIUM (HIGH com ≥ 16) |
+| `CREDENTIAL_STUFFING`  | Um IP falhando em ≥ 5 contas diferentes em 1 h          | `LOGIN_FAILURE`          | HIGH                   |
+| `TOKEN_REUSE`          | Refresh token reutilizado fora da janela (≥ 1 em 24 h)  | `TOKEN_REUSE_DETECTED`   | HIGH                   |
+| `RATE_LIMIT_ABUSE`     | O mesmo IP bloqueado pelo rate limit ≥ 3 vezes em 1 h   | `RATE_LIMIT_EXCEEDED`    | LOW (MEDIUM com ≥ 6)   |
+| `ADMIN_ACCESS_PROBING` | Um usuário com ≥ 5 acessos negados a rotas admin em 1 h | `ACCESS_DENIED`          | MEDIUM (HIGH com ≥ 10) |
+| `PASSWORD_RESET_ABUSE` | ≥ 5 pedidos de recuperação do mesmo IP em 1 h           | `PASSWORD_RESET_REQUEST` | LOW (MEDIUM com ≥ 10)  |
+
+- **Limites e janelas** configuráveis por variável de ambiente (`ALERT_BRUTE_FORCE_ACCOUNT=8/1h`
+  etc.). A severidade **sobe** ao atingir o dobro do limite e **nunca desce**.
+- **Deduplicação deslizante:** enquanto a mesma regra e o mesmo alvo tiverem atividade com
+  intervalos menores que `ALERTS_DEDUP_WINDOW_HOURS` (24 h), o incidente é **um** alerta
+  aberto, mesmo atravessando a meia-noite. Novas ocorrências somam em `eventCount`. Depois de
+  um intervalo maior que a janela, ou se o alerta estiver `RESOLVED`, abre-se um alerta novo.
+  O advisory lock do motor e o índice único parcial do PostgreSQL impedem duplicatas mesmo com
+  gravações simultâneas.
+- **Evidências:** limite, janela, pico, tipo de evento, alvo e até 10 ids de eventos. O alvo é
+  o `userId` quando existe, ou o IP nas regras em que o IP é o próprio alvo. **Nunca** email,
+  hash de email, senha ou token.
+
+```powershell
+$h = @{ Authorization = "Bearer $($adminLogin.accessToken)" }
+Invoke-RestMethod -Uri "$api/admin/security-alerts?status=OPEN&severity=HIGH&page=1&pageSize=20" -Headers $h
+Invoke-RestMethod -Uri "$api/admin/security-alerts/<id>" -Headers $h
+Invoke-RestMethod -Method Post -Uri "$api/admin/security-alerts/<id>/explanation" -Headers $h
+npm run alerts:process   # rodada manual (seguro junto com a API)
+```
+
+```jsonc
+// GET /admin/security-alerts?rule=BRUTE_FORCE_ACCOUNT → 200 (real, servidor compilado)
+{ "data": [ { "id": "…", "rule": "BRUTE_FORCE_ACCOUNT", "severity": "MEDIUM", "status": "OPEN",
+              "summary": "8 ou mais falhas de login para a mesma conta em 1 h", "eventCount": 1,
+              "details": { "threshold": 8, "windowSeconds": 3600, "peak": 8, "eventType": "LOGIN_FAILURE",
+                           "subject": { "kind": "account", "userId": "01a194f4-…" }, "sampleEventIds": ["…"] },
+              "userId": "01a194f4-…", "firstSeenAt": "…", "lastSeenAt": "…", "resolvedAt": null, … } ],
+  "pagination": { "page": 1, "pageSize": 20, "total": 1, "totalPages": 1 } }
+```
+
+**IA local opcional (explicação).** `POST /admin/security-alerts/:id/explanation` pede a um
+modelo **local** (Ollama) uma explicação em texto. Ela é **desligada por padrão** (`"status": "disabled"`).
+A IA não detecta, não decide, não grava e não altera nada: só explica, e a resposta vem marcada
+com `"advisory": true`. Para habilitar:
+
+```powershell
+ollama pull qwen2.5:7b                       # feito por você; a API nunca baixa modelos
+# no .env: ALERTS_AI_ENABLED=true  (OLLAMA_URL só aceita localhost/127.0.0.1/::1)
+```
+
+```jsonc
+// POST /admin/security-alerts/:id/explanation → 200 (real, qwen2.5:7b local, ~2 s com o modelo carregado)
+{ "status": "ok", "advisory": true, "model": "qwen2.5:7b",
+  "explanation": { "summary": "Houve tentativas de login fracassadas para a mesma conta em um período de 1 hora.",
+                   "likelyCauses": ["Ataque de força bruta", "Autenticação inválida"],
+                   "suggestedChecks": ["Verificar atividade suspeita", "Ajustar configurações de autenticação"] } }
+
+// Ollama fora do ar, lento demais ou resposta fora do formato → 200, alerta intacto
+{ "status": "unavailable", "advisory": true, "reason": "TIMEOUT" }   // ou UNREACHABLE / INVALID_RESPONSE
+```
+
+A IA recebe só a regra, a severidade, os números e a duração do incidente: nunca IP, email, ids
+ou datas absolutas. A primeira chamada pode demorar enquanto o modelo é carregado na memória.
+Medido aqui: ultrapassou 90 s a frio e levou 2 s depois. Detalhes, limitações e falsos
+positivos em [`docs/architecture.md`](docs/architecture.md#etapa-9-motor-de-alertas-de-segurança).
+
 ### Recuperação de senha
 
 1. `POST /api/v1/auth/forgot-password` com `{"email": "..."}` responde **sempre `202`** com a
@@ -503,5 +578,6 @@ tinha `ada.admin@example.com` como ADMIN (seed da Etapa 2), ela continua ADMIN.
 | `npm run db:seed`                                          | Popula o banco de desenvolvimento com dados fictícios                            |
 | `npm run admin:promote -- --email <e> --confirm <e>`       | Promove um usuário fictício local a ADMIN (bloqueado em produção)                |
 | `npm run audit:retention [-- --execute --confirm <banco>]` | Retenção da auditoria: simula por padrão; apagar exige habilitação e confirmação |
+| `npm run alerts:process`                                   | Uma rodada do motor de alertas (cron/manual; seguro junto com a API)             |
 | `npm run db:studio`                                        | Abre o Prisma Studio                                                             |
 | `npm run db:generate`                                      | Regenera o Prisma Client após mudar o schema                                     |

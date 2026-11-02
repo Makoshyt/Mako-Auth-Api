@@ -112,6 +112,25 @@ export const POLICY_DEFINITIONS = {
     onStoreFailure: 'closed',
     exposeHeaders: true,
   },
+  // Alertas (Etapa 9): leituras de ADMIN; a explicação por IA é mais cara, por isso mais restrita.
+  adminSecurityAlerts: {
+    envKey: 'RATE_LIMIT_ADMIN_SECURITY_ALERTS',
+    scope: 'user',
+    onStoreFailure: 'open',
+    exposeHeaders: true,
+  },
+  adminSecurityAlertById: {
+    envKey: 'RATE_LIMIT_ADMIN_SECURITY_ALERT_BY_ID',
+    scope: 'user',
+    onStoreFailure: 'open',
+    exposeHeaders: true,
+  },
+  adminSecurityAlertExplain: {
+    envKey: 'RATE_LIMIT_ADMIN_SECURITY_ALERT_EXPLAIN',
+    scope: 'user',
+    onStoreFailure: 'closed',
+    exposeHeaders: true,
+  },
 } as const satisfies Record<string, PolicyDefinition>;
 
 export type PolicyName = keyof typeof POLICY_DEFINITIONS;
